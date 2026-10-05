@@ -28,38 +28,58 @@ git clone git@github.com:ruribou/.claude.git .claude
 ├── verify.conf.example    検証アダプター設定の例（プロジェクト側で verify.conf にコピー）
 ├── agents/
 │   ├── task-planner.md    対話ヒアリング → 実装計画ドキュメント作成
-│   └── implementer.md     実装計画に沿ってステップ実行
+│   └── implementer.md     実装フローから 1 単位を受け取り実装・コミット
 ├── commands/
 │   ├── create-task.md     /create-task  タスク（実装計画）作成
-│   ├── start-with-plan.md /start-with-plan <path>  実装開始
+│   ├── start-with-plan.md /start-with-plan <path>  計画ファイルから実装フローを開始（互換入口）
 │   ├── code-review.md     /code-review  並列レビュー
 │   ├── pr-create.md       /pr-create    PR 作成
 │   └── clean-branch.md    /clean-branch マージ済みブランチ整理
 ├── scripts/
+│   ├── checkpoint         実装フローの進行状態の保存・再開時の照合
+│   ├── checkpoint.md      段階・照合・保存先の仕様
 │   ├── git-guard          git / gh を実行直前の状態と照合する Hook
 │   ├── git-guard.md       自律実行の判断基準・停止条件・判定表
 │   ├── verify             検証の共通入口（明示した検証の実行と証跡記録）
 │   └── verify.md          アダプター設定・結果・証跡の仕様
 └── skills/
     ├── SKILL.md           プロジェクト固有トラブルシュート置き場（テンプレート）
+    ├── implement-issue/SKILL.md  /implement-issue <issue>  1 Issue の実装フロー（手順の正本）
     └── verify/SKILL.md    /verify  検証を手動実行して結果を報告
 ```
 
 ## 想定ワークフロー
 
+普段の入口は `/implement-issue <issue番号>`。1 件の Issue を、仕様確認から PR まで進める。
+
+```
+/implement-issue 12             # Issue の目的・受入条件・対象外を確認
+  ├─ implementer                # 小さな実装単位ごとに実装・コミット
+  ├─ .claude/scripts/verify     # 明示した検証を実行し、証跡を残す
+  ├─ reviewer                   # 読み取り専用の独立レビュー（指摘は implementer が修正 → 再検証・再レビュー）
+  └─ push → PR                  # 最終 commit の検証・レビュー後に push。--merge で条件を満たせば統合まで
+```
+
+計画ファイルから始める場合:
+
 ```
 /create-task "やりたいこと"     # task-planner が対話でヒアリング → docs/tasks/*.md を生成
         ↓
-/start-with-plan <file>         # implementer がステップごとに実装・検証・コミット
-        ↓
-/code-review                    # 4観点で並列レビュー → 指摘を修正
-        ↓
-/pr-create                      # ベースブランチ自動検出で PR 作成
+/start-with-plan <file>         # 上と同じフローを、計画ファイルを入力にして進める
 ```
+
+- フローを進めるのはメイン側（Skill を実行している会話）。implementer → verify → reviewer を順に呼び、subagent から subagent は起動しない
+- 進行状態は `.claude/scripts/checkpoint` が worktree ごとのローカル checkpoint（`<git-dir>/claude-run/`）に保存する。中断後に同じコマンドを実行すると再開する
+- 再開時は branch・worktree・remote・Issue 本文 / 計画を照合し、一致しない checkpoint は使わない。編集・commit・rebase で古くなった verify / review は無効化され、その段階からやり直す
+- 修正サイクルが上限（既定 3 回）を超えた、解消できない指摘・権限・要件の不足がある場合は、理由と必要な判断を示して BLOCKED で止まる
+- 完了と報告するのは、受入条件・verify・review・push・PR の証跡が揃ったときだけ。checkpoint には会話・Issue 本文・権限を保存しない
+
+詳細は [`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md) と [`scripts/checkpoint.md`](scripts/checkpoint.md)。レビューの `/review-issue`・`.claude/scripts/review`・`agents/reviewer.md` は #4 で追加される（無い環境ではレビュー段階が BLOCKED になる）。
 
 補助コマンド:
 
-- `/verify` — プロジェクトが明示した検証を実行し、現在の差分に結び付いた証跡を残す
+- `/verify` — プロジェクトが明示した検証を実行し、現在の差分に結び付いた証跡を残す（`/implement-issue` も同じ入口を使う）
+- `/code-review`・`/pr-create` — レビュー・PR 作成だけを単独で行う
 - `/clean-branch` — マージ済みのローカルブランチを安全に整理する
 
 ## 検証の設定
@@ -73,7 +93,7 @@ cp .claude/verify.conf.example .claude/verify.conf   # check 行を書く
 .claude/scripts/verify status                        # 最新の証跡が現在の差分で有効か
 ```
 
-証跡とログは `<git-dir>/claude-verify/` に置かれ、コミットや送信はされない。`/start-with-plan`・`/code-review`・`/pr-create` はこの共通入口を使う。詳細は [`scripts/verify.md`](scripts/verify.md)。
+証跡とログは `<git-dir>/claude-verify/` に置かれ、コミットや送信はされない。`/implement-issue`（`/start-with-plan`）・`/code-review`・`/pr-create` はこの共通入口を使う。詳細は [`scripts/verify.md`](scripts/verify.md)。
 
 ## 設計方針
 

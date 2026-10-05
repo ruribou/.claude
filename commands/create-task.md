@@ -19,16 +19,11 @@ argument-hint: <やりたいこと>
 
 ## ワークフロー
 
+このコマンドは計画の作成までを行う。実装・検証・レビュー・PR の手順は `.claude/skills/implement-issue/SKILL.md` が正本で、ここでは持たない。
+
 ```
-/create-task "やりたいこと"     # タスク作成（このコマンド）
+/create-task "やりたいこと"     # 計画作成（このコマンド）→ docs/tasks/*.md
 ↓
-対話でヒアリング（3回）
-↓
-ドキュメント草案作成・修正
-↓
-/start-with-plan <ファイル名>   # 実装開始
-↓
-/code-review                    # コードレビュー
-↓
-/pr-create                      # PR作成
+/start-with-plan <ファイル名>   # 計画を入力に /implement-issue と同じフローで
+                                # 実装 → verify → 独立レビュー → commit / push / PR
 ```
