@@ -1,63 +1,44 @@
 ---
-description: コードレビューを実行する
-allowed-tools: [Agent, Read, Grep, Glob, "Bash(git:*)", "Bash(.claude/scripts/verify:*)"]
+description: 現在のブランチの差分を読み取り専用でレビューする（修正・コミットはしない）
+allowed-tools:
+  [
+    Agent,
+    Read,
+    "Bash(.claude/scripts/verify:*)",
+    "Bash(.claude/scripts/review:*)",
+  ]
+argument-hint: "[-- <pathspec>...]"
 ---
 
-現在のブランチの変更内容に対してコードレビューを実行する。
+現在のブランチの変更内容（未コミット・未追跡のファイルを含む）を、`/review-issue` と同じ `reviewer` エージェントで読み取り専用レビューする。Issue を指定しないブランチ差分レビューの入口で、受入条件の照合を除けば `/review-issue` と同じ手順・同じ判定になる。
+
+## 引数
+
+- `$ARGUMENTS`（任意）: `-- <pathspec>...` でレビュー範囲を絞る。Issue に対してレビューする場合は `/review-issue <issue>` を使う
 
 ## 手順
 
-1. ベースブランチを特定する（`develop` → `main` の順で存在するものを使う。以降 `<base>` と表記）
-2. `git diff origin/<base>...HEAD` で変更差分を取得する
-3. `git diff --name-only origin/<base>...HEAD` で変更ファイル一覧を取得する
-4. 以下の4つの観点でレビューを **並列に** 実行する（Agent ツールで並列起動）
+1. `.claude/scripts/verify status` で現在の差分に対する検証証跡を確認する。`VALID` でなければ `.claude/scripts/verify run` を実行する
+   - lint / test などの検証はこの共通入口だけで行う。検証コマンドを manifest から推測して独自に実行しない
+   - 結果が `FAIL` / `BLOCKED` でもレビューは続ける（packet に記録され、PASS にはならない）
+2. `.claude/scripts/review build [-- <pathspec>...]` で packet を作る
+   - ベースは `develop` → `main` の順で自動検出する。別のベースは `--base <ref>` で指定する
+   - 出力の `review_id` と `packet` のパスを控える。packet の中身はここで読まない
+3. Agent ツールで `subagent_type: reviewer` を起動する。プロンプトには次だけを渡す
+   ```
+   review_id: <review_id>
+   packet: <packet のパス>
+   この packet をレビューし、定義どおりの形式で結果を返してください。
+   ```
+   - 実装の経緯・会話の要約は渡さない
+4. reviewer の出力を変更せずに `.claude/scripts/review record <review_id>` の標準入力に渡す（引用符付きの heredoc で、区切りは `REVIEW_RESULT_<review_id>` のように本文と衝突しないものにする）
+5. 次をユーザーに報告する
+   - `record` が出した最終判定（`PASS` / `CHANGES_REQUESTED` / `BLOCKED`）と理由
+   - reviewer の「レビュー範囲」「指摘」（Critical / Warning / Info、ファイル・行付き）「未確認事項」
+   - 結果ファイルのパス
 
-### 観点1: セキュリティ
+観点は `.claude/review-patterns.md`、判定基準と出力形式は `.claude/agents/reviewer.md` にある。
 
-- ハードコードされたシークレット / APIキー / 認証情報
-- インジェクション脆弱性（SQL / コマンド / テンプレート / XSS 等）
-- 信頼できない入力のバリデーション不足
-- 危険な動的評価（`eval` 相当）や安全でないデシリアライズ
-- 認可・権限チェックの漏れ
+## 指摘の修正
 
-### 観点2: 設計品質・保守性
-
-- 責務の分離（UI / ドメイン / インフラ層の境界）
-- コード重複、過度な抽象化、早すぎる最適化
-- エラーハンドリングの漏れ・握り潰し
-- 可読性、関数・モジュールの粒度
-
-### 観点3: 正確性・パフォーマンス・並行性
-
-- 境界条件・例外ケースの考慮
-- N+1 / 不要なループ / 非効率なアルゴリズム
-- リソースリーク（ファイル / コネクション / ハンドラ / リスナー）
-- 並行性・競合状態、非同期処理のキャンセル / クリーンアップ
-
-### 観点4: プロジェクト規約・静的検査
-
-- `.claude/scripts/verify status` で現在の差分に対する検証証跡を確認する。`VALID` でなければ `.claude/scripts/verify run` を実行し、結果（`PASS` / `FAIL` / `BLOCKED` と理由）をレポートに含める
-  - 検証コマンドを manifest から推測して独自に実行しない。`BLOCKED` や古い証跡を PASS として扱わない
-- 命名の明確さ、マジックナンバー、未使用コード、不要な import
-
-5. 4つの観点の結果を統合し、以下の形式でレポートを出力する
-
-## レポート形式
-
-```
-## コードレビュー結果
-
-### Critical（必ず修正）
-- [ ] ...
-
-### Warning（修正推奨）
-- [ ] ...
-
-### Info（検討事項）
-- [ ] ...
-
-### Good（良い点）
-- ...
-```
-
-6. Critical・Warning の指摘事項を修正し、コミットする
+このコマンドは指摘を修正しない・コミットしない・PR にコメントしない。修正が必要な場合は、ユーザーの指示を受けて明示的な実装ステップ（`/implement-issue`・`/start-with-plan` や個別の修正依頼）で行い、その後もう一度 `/code-review` を実行する。レビュー後に差分や検証証跡が変わると、`.claude/scripts/review status` は以前の結果を `STALE` と判定する。
