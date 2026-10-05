@@ -21,9 +21,8 @@ args: path
    - 既存コードへの影響を確認してから変更する
    - プロジェクトの既存のコード規約・設計に倣う
 4. 各ステップ完了時に TaskUpdate でステータスを更新する
-5. 全ステップ完了後、プロジェクトの検証コマンド（lint / type check / test / build 等）が存在する場合は実行する
-   - 実行すべきコマンドは `package.json` / `Makefile` / `justfile` / `Cargo.toml` / `pyproject.toml` などから検出する
-   - 警告・エラーがあれば修正する
+5. 全ステップ完了後、`.claude/scripts/verify run` で検証する（implementer エージェントのワークフロー手順 5 と同じ扱い）
+   - `FAIL` は修正して再実行する。`BLOCKED` は理由を報告し、PASS として扱わない
 6. 適切な粒度でコミットする
 7. 完了報告を出力する
 

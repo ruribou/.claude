@@ -1,0 +1,24 @@
+# verify.conf の例。プロジェクト側で .claude/verify.conf にコピーして書き換える。
+# 仕様: .claude/scripts/verify.md
+#
+#   check <id> <作業ディレクトリ> <argv...>   必須検証（宣言順にすべて実行）
+#   input <追加入力パス>                      git が追跡しないビルド入力（ignore 済みのファイル / ディレクトリ）
+#
+# argv は空白区切りでそのまま実行し、シェル展開（引用符・変数・グロブ・パイプ）はしない。
+# シェルの機能が必要なら検証スクリプトを用意してそのパスを書く。
+
+# 例: Node.js（ルート）
+# check lint      .        npm run lint
+# check typecheck .        npm run typecheck
+# check test      .        npm test
+
+# 例: Go のサブディレクトリ
+# check vet       backend  go vet ./...
+# check test      backend  go test ./...
+
+# 例: 独自スクリプト
+# check test      .        scripts/ci/test.sh
+
+# 例: ignore 済みの生成物やローカル設定もビルド入力として扱う
+# input generated/schema
+# input .env.local

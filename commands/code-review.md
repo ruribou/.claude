@@ -36,8 +36,8 @@ allowed-tools: [Agent, Bash, Read, Grep, Glob]
 
 ### 観点4: プロジェクト規約・静的検査
 
-- プロジェクトで設定されている linter / formatter / 型チェッカーを実行し、警告・エラーを確認する
-  - 実行コマンドは `package.json` / `Makefile` / `justfile` / `Cargo.toml` / `pyproject.toml` 等から検出する
+- `.claude/scripts/verify status` で現在の差分に対する検証証跡を確認する。`VALID` でなければ `.claude/scripts/verify run` を実行し、結果（`PASS` / `FAIL` / `BLOCKED` と理由）をレポートに含める
+  - 検証コマンドを manifest から推測して独自に実行しない。`BLOCKED` や古い証跡を PASS として扱わない
 - 命名の明確さ、マジックナンバー、未使用コード、不要な import
 
 5. 4つの観点の結果を統合し、以下の形式でレポートを出力する
