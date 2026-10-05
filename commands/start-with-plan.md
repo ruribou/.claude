@@ -1,7 +1,7 @@
 ---
 description: 実装計画ドキュメントに基づいて実装を開始する
 allowed-tools:
-  [Agent, Bash, Read, Write, Edit, Grep, Glob, TaskCreate, TaskUpdate]
+  [Agent, Read, Write, Edit, Grep, Glob, TaskCreate, TaskUpdate, "Bash(git:*)"]
 args: path
 ---
 
