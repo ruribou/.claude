@@ -15,10 +15,11 @@ usage: checkpoint <command> [args]
 
 commands:
   start (--issue <n> --issue-file <path> | --plan <path>) [--remote <name>] [--repo <owner/name>]
-        [--base <ref>] [--max-attempts <n>]
+        [--base <ref>] [--max-attempts <n>] [--session <id>]
                              run を作り、run_id を表示する（作業 branch を用意してから実行）
   resume [--issue-file <path>] 実際の作業ツリー・証跡と照合し、有効な段階まで戻して表示する
   status                     resume と同じ照合をするが、checkpoint を書き換えない
+  check                      status と同じ照合結果を key=value で表示する（Stop hook 用。書き換えない）
   criteria                   stdin の「<受入条件> :: <検証方法>」行で受入条件を置き換える
   set <key=value>...         stage（spec / implementing / implemented）/ next / pr / max_attempts を更新する
   record-verify              現在 VALID な verify 証跡を記録し stage=verified にする
@@ -280,6 +281,7 @@ print_report() {
 
 cmd_start() {
   local issue="" issue_file="" plan="" remote="origin" repo="" base="" max="$DEFAULT_MAX_ATTEMPTS"
+  local session="${CLAUDE_CODE_SESSION_ID:-}"
   while [ $# -gt 0 ]; do
     case "$1" in
       --issue) [ $# -ge 2 ] || die_usage "--issue requires a number"; issue="$2"; shift 2 ;;
@@ -289,6 +291,7 @@ cmd_start() {
       --repo) [ $# -ge 2 ] || die_usage "--repo requires owner/name"; repo="$2"; shift 2 ;;
       --base) [ $# -ge 2 ] || die_usage "--base requires a ref"; base="$2"; shift 2 ;;
       --max-attempts) [ $# -ge 2 ] || die_usage "--max-attempts requires a number"; max="$2"; shift 2 ;;
+      --session) [ $# -ge 2 ] || die_usage "--session requires an id"; session="$2"; shift 2 ;;
       *) die_usage "unknown argument: $1" ;;
     esac
   done
@@ -332,6 +335,7 @@ cmd_start() {
   {
     printf 'schema=%s\n' "$SCHEMA"
     printf 'run_id=%s\n' "$RUN_ID"
+    printf 'session_id=%s\n' "$(one_line "$session")"
     printf 'target=%s\n' "$target"
     printf 'repo=%s\n' "$(one_line "$repo")"
     printf 'remote=%s\n' "$remote"
@@ -396,6 +400,32 @@ cmd_resume() {
     RESUMED_FROM="$from"
   fi
   print_report "$([ "$write" = "1" ] && printf 'RESUME' || printf 'STATUS')"
+}
+
+# Stop hook 用: 照合結果を key=value で表示する。checkpoint は書き換えない。
+cmd_check() {
+  [ $# -eq 0 ] || die_usage "check は引数を取らない"
+  load_active || { printf 'active=none\n'; exit 3; }
+  NOTES=""
+  check_context ""
+  printf 'active=%s\n' "$RUN_ID"
+  printf 'state=%s\n' "$RUN_DIR/state"
+  printf 'session_id=%s\n' "$(get session_id)"
+  printf 'target=%s\n' "$(get target)"
+  printf 'recorded_stage=%s\n' "$(get stage)"
+  if [ -n "$MISMATCHES" ]; then
+    printf 'mismatch=1\nstage=%s\n' "$(get stage)"
+    printf '%s' "$MISMATCHES" | sed 's/^/note=/'
+  else
+    effective_stage
+    printf 'mismatch=0\nstage=%s\n' "$EFFECTIVE"
+    printf '%s' "$NOTES" | sed 's/^/note=/'
+  fi
+  printf 'next=%s\n' "$(get next)"
+  printf 'blocked_reason=%s\n' "$(get blocked_reason)"
+  if [ -x "$SCRIPT_DIR/verify" ]; then
+    printf 'fingerprint=%s\n' "$("$SCRIPT_DIR/verify" fingerprint 2>/dev/null | sed -n 's/^fingerprint //p')"
+  fi
 }
 
 next_for() {
@@ -469,7 +499,7 @@ cmd_set() {
         put pr "$v"
         log_event "pr=$v"
         ;;
-      *) die_usage "変更できない key: $k（target / repo / branch などは start で決まる）" ;;
+      *) die_usage "変更できない key: ${k}（target / repo / branch などは start で決まる）" ;;
     esac
   done
 }
@@ -591,6 +621,7 @@ case "$COMMAND" in
   start) cmd_start "$@" ;;
   resume) cmd_resume 1 "$@" ;;
   status) cmd_resume 0 "$@" ;;
+  check) cmd_check "$@" ;;
   criteria) cmd_criteria "$@" ;;
   set) cmd_set "$@" ;;
   record-verify) cmd_record_verify "$@" ;;

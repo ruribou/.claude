@@ -26,6 +26,7 @@ git clone git@github.com:ruribou/.claude.git .claude
 ├── settings.local.json    ユーザーローカル設定（共有しない / .gitignore 推奨）
 ├── review-patterns.md     言語非依存のレビュー観点チェックリスト
 ├── verify.conf.example    検証アダプター設定の例（プロジェクト側で verify.conf にコピー）
+├── stop-hook.settings.example.json  完了前確認 Stop hook の設定例（opt-in・既定では無効）
 ├── agents/
 │   ├── task-planner.md    対話ヒアリング → 実装計画ドキュメント作成
 │   ├── implementer.md     実装フローから 1 単位を受け取り実装・コミット
@@ -45,7 +46,9 @@ git clone git@github.com:ruribou/.claude.git .claude
 │   ├── verify             検証の共通入口（明示した検証の実行と証跡記録）
 │   ├── verify.md          アダプター設定・結果・証跡の仕様
 │   ├── review             レビュー packet の作成と結果の記録・鮮度判定
-│   └── review.md          packet・判定・鮮度の仕様
+│   ├── review.md          packet・判定・鮮度の仕様
+│   ├── stop-hook          完了前確認の Stop hook（opt-in。checkpoint の active run だけが対象）
+│   └── stop-hook.md       Stop hook の判定・限界・導入方法の仕様
 └── skills/
     ├── implement-issue/SKILL.md  /implement-issue <issue>  1 Issue の実装フロー（手順の正本）
     ├── project-knowledge/ プロジェクト固有知識を必要時に参照する Skill
@@ -113,6 +116,17 @@ cp .claude/verify.conf.example .claude/verify.conf   # check 行を書く
 4. `.claude/scripts/review record` が結果を保存し、検証証跡が `VALID` でない・受入条件がない・差分がない・レビュー中に入力が変わった場合は PASS にしない
 
 `.claude/scripts/review status` は、レビュー後に差分・ベース・検証証跡・Issue 本文が変わっていれば `STALE` を返す。PASS は確認した範囲の結果であり、人間のレビューや承認の代わりではない。詳細は [`scripts/review.md`](scripts/review.md)。
+
+## 完了前確認の Stop hook（opt-in）
+
+`/implement-issue` の run（`checkpoint start` で開始したもの）を、証跡で裏付けられた `done` か理由付きの `blocked` になる前に終えてしまう取り違えを補助する Stop hook を用意している。**既定では有効化されない。** 内容と下記の限界を確認したうえで、[`stop-hook.settings.example.json`](stop-hook.settings.example.json) の `hooks.Stop` を `.claude/settings.json` か `.claude/settings.local.json` にマージして使う。
+
+- 対象は、この session が開始した active な run だけ。run がない・別 session・別 worktree の停止は止めない（通常の質問への回答はそのまま終わる）
+- 判定は `checkpoint check`（`verify status` / `review status`）に委ね、未完了・証跡が古い場合だけ `decision: "block"` で段階・次の作業・止まり方（`checkpoint block`）を返す
+- 同じ状態での再 block はせず、1 ターンの block 回数にも上限がある。hook 内では build / test / LLM 呼び出し / commit / push / PR 作成をせず、確認時間に上限（既定 20 秒）を設けている
+- **保証の範囲**: hook の不実行・失敗・timeout・利用者の中断ではそのまま停止し、これらを検証・レビュー PASS とはみなさない。merge gate や CI / branch protection の代わりではない
+
+詳細は [`scripts/stop-hook.md`](scripts/stop-hook.md)。
 
 ## 設計方針
 
