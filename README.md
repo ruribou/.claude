@@ -38,11 +38,9 @@ git clone git@github.com:ruribou/.claude.git .claude
 ├── scripts/
 │   ├── verify             検証の共通入口（明示した検証の実行と証跡記録）
 │   └── verify.md          アダプター設定・結果・証跡の仕様
-├── skills/
-│   ├── SKILL.md           プロジェクト固有トラブルシュート置き場（テンプレート）
-│   └── verify/SKILL.md    /verify  検証を手動実行して結果を報告
-└── tests/
-    └── verify.test.sh     scripts/verify のテスト
+└── skills/
+    ├── SKILL.md           プロジェクト固有トラブルシュート置き場（テンプレート）
+    └── verify/SKILL.md    /verify  検証を手動実行して結果を報告
 ```
 
 ## 想定ワークフロー
