@@ -1,6 +1,6 @@
 ---
 description: コードレビューを実行する
-allowed-tools: [Agent, Bash, Read, Grep, Glob]
+allowed-tools: [Agent, Read, Grep, Glob, "Bash(git:*)"]
 ---
 
 現在のブランチの変更内容に対してコードレビューを実行する。
