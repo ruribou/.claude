@@ -28,9 +28,10 @@ spec → implementing → implemented → verified → reviewed → published �
 
 | コマンド | 内容 | 終了コード |
 | --- | --- | --- |
-| `start (--issue <n> --issue-file <path> \| --plan <path>) [--remote <name>] [--repo <owner/name>] [--base <ref>] [--max-attempts <n>]` | run を作る。active な run が終わっていなければ作らない | `0` / `3`=active run あり |
+| `start (--issue <n> --issue-file <path> \| --plan <path>) [--remote <name>] [--repo <owner/name>] [--base <ref>] [--max-attempts <n>] [--session <id>]` | run を作る。active な run が終わっていなければ作らない。`--session` の既定は `CLAUDE_CODE_SESSION_ID`（Stop hook の対象判定に使う） | `0` / `3`=active run あり |
 | `resume [--issue-file <path>]` | 照合し、証跡で裏付けられる段階まで戻して保存・表示する | `0` / `1`=MISMATCH / `3`=run なし |
 | `status [--issue-file <path>]` | `resume` と同じ照合をするが書き換えない | 同上 |
+| `check` | `status` と同じ照合結果を key=value で表示する（[Stop hook](stop-hook.md) 用。書き換えない） | `0` / `3`=run なし |
 | `criteria` | stdin の `<受入条件> :: <検証方法>` 行で受入条件を置き換える | `0` / `64`=形式違反 |
 | `set <key=value>...` | `stage`（`spec` / `implementing` / `implemented`）・`next`・`pr`・`max_attempts` | `0` / `64` |
 | `record-verify` | `verify status` が VALID なら最新の verify run を記録して `verified` | `0` / `1` / `2`=verify がない |
@@ -77,10 +78,11 @@ verify の fingerprint は HEAD・staged・unstaged・未追跡ファイルを�
     ├── state              key=value（下記）
     ├── criteria           受入条件 :: 検証方法（1 行 1 件）
     ├── baseline           run 開始前から変更されていたパス（内容は保存しない）
-    └── log                段階遷移の記録（時刻・stage・証跡 ID）
+    ├── log                段階遷移の記録（時刻・stage・証跡 ID）
+    └── stop-hook          Stop hook の連続 block 回数と直前の理由（hook だけが書く）
 ```
 
-`state` のキー: `schema` `run_id` `target`（`issue:<n>` / `plan:<path>`）`repo` `remote` `remote_url` `worktree` `git_dir` `branch` `base` `start_head` `issue_hash` `plan_hash` `stage` `next` `attempts` `max_attempts` `verify_run` `verify_fingerprint` `verified_head` `review_id` `pushed_oid` `pr` `blocked_reason` `created_at` `updated_at`
+`state` のキー: `schema` `run_id` `session_id` `target`（`issue:<n>` / `plan:<path>`）`repo` `remote` `remote_url` `worktree` `git_dir` `branch` `base` `start_head` `issue_hash` `plan_hash` `stage` `next` `attempts` `max_attempts` `verify_run` `verify_fingerprint` `verified_head` `review_id` `pushed_oid` `pr` `blocked_reason` `created_at` `updated_at`
 
 保存しないもの: 会話・実装の経緯、Issue 本文や差分の本文、コマンド本文、権限・承認の状態。再開時の権限は現在の設定と利用者の指示で判断し、checkpoint から復元・拡大しない。
 

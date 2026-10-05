@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# stop-hook — Claude Code の Stop hook（opt-in）。この session の checkpoint の active run だけを確認する。
+# 仕様: scripts/stop-hook.md（配置後は .claude/scripts/stop-hook.md）
+# 判定は checkpoint check（verify status / review status）に委ね、検証・レビューを再実行しない。
+# 止める場合は exit 0 + {"decision":"block"} を返す。exit 2 は使わない（hook 自体の失敗と区別するため）。
+# bash 3.2 互換を保つ（macOS 標準 bash で動かすため）。
+
+set -o pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+CHECKPOINT="${CLAUDE_STOP_HOOK_CHECKPOINT:-$SCRIPT_DIR/checkpoint}"
+CHECK_TIMEOUT="${CLAUDE_STOP_HOOK_TIMEOUT:-20}"
+TTL_MINUTES="${CLAUDE_STOP_HOOK_TTL_MINUTES:-1440}"
+MAX_BLOCKS="${CLAUDE_STOP_HOOK_MAX_BLOCKS:-3}"
+
+json_str() {
+  local s
+  s=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | LC_ALL=C awk 'BEGIN { ORS = "\\n" } { print }' | LC_ALL=C tr -d '\000-\037')
+  printf '"%s"' "${s%\\n}"
+}
+
+allow() { exit 0; }
+
+# 停止は許可し、Claude と利用者に注意だけを返す。
+warn() {
+  printf '{"systemMessage": %s}\n' "$(json_str "$1")"
+  exit 0
+}
+
+# hook 自体の失敗。Claude Code では非ブロッキングのエラーとして扱われ、停止はそのまま進む。
+hook_error() {
+  printf 'stop-hook: %s。証跡は確認されていません\n' "$1" >&2
+  exit 1
+}
+
+# トップレベルの文字列値を取り出す。他の値の中に現れるキーは \" で囲まれるため一致しない。
+json_string_field() {
+  printf '%s' "$INPUT" | sed -nE "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"(([^\"\\\\]|\\\\.)*)\".*/\1/p" | head -n 1 |
+    sed -e 's/\\"/"/g' -e 's/\\\//\//g' -e 's/\\\\/\\/g'
+}
+
+json_bool_field() {
+  printf '%s' "$INPUT" | grep -Eo "\"$1\"[[:space:]]*:[[:space:]]*(true|false)" | head -n 1 | grep -Eo '(true|false)$'
+}
+
+# with_timeout <秒> <command...>: 上限を超えたら打ち切って 124 を返す（coreutils の timeout がない環境向け）。
+# 出力は一時ファイル経由で返す。打ち切った command の子プロセスが残っても $(...) を待たせないため。
+with_timeout() {
+  local limit="$1" pid watcher code out mark
+  shift
+  out=$(mktemp "${TMPDIR:-/tmp}/stop-hook.XXXXXX") || return 1
+  mark="$out.timeout"
+  "$@" </dev/null >"$out" 2>/dev/null &
+  pid=$!
+  (
+    sleep "$limit" &
+    sleeper=$!
+    trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+    wait "$sleeper"
+    : >"$mark"
+    kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null
+  ) </dev/null >/dev/null 2>&1 &
+  watcher=$!
+  wait "$pid" 2>/dev/null
+  code=$?
+  kill "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
+  [ ! -f "$mark" ] || code=124
+  cat "$out"
+  rm -f "$out" "$mark"
+  return "$code"
+}
+
+field() { printf '%s\n' "$CHECK" | sed -n "s/^$1=//p" | head -n 1; }
+
+# ---------------------------------------------------------------- 入力
+
+INPUT=$(cat | LC_ALL=C tr '\n\r' '  ')
+SESSION=$(json_string_field session_id)
+CWD=$(json_string_field cwd)
+HOOK_ACTIVE=$(json_bool_field stop_hook_active)
+
+# session を特定できない入力では対象 run を決められないので止めない。
+[ -n "$SESSION" ] || allow
+if [ -n "$CWD" ] && [ -d "$CWD" ]; then
+  cd "$CWD" || allow
+fi
+git rev-parse --show-toplevel >/dev/null 2>&1 || allow
+[ -x "$CHECKPOINT" ] || allow
+
+# ---------------------------------------------------------------- checkpoint の照合
+
+CHECK=$(with_timeout "$CHECK_TIMEOUT" "$CHECKPOINT" check)
+CODE=$?
+case "$CODE" in
+  0) ;;
+  3) allow ;;   # active run なし
+  124) warn "実装 run の証跡確認が ${CHECK_TIMEOUT} 秒で終わりませんでした。検証・レビューが PASS とはみなしていません。" ;;
+  *) hook_error "checkpoint check が失敗しました (exit $CODE)" ;;
+esac
+
+STATE=$(field state)
+STAGE=$(field stage)
+# 壊れた checkpoint は判定に使わない（checkpoint start / abandon で置き換えられる）。
+[ -n "$STATE" ] && [ -f "$STATE" ] && [ -n "$STAGE" ] || allow
+# 別 session の run（session_id 未記録を含む）は対象にしない。
+[ "$(field session_id)" = "$SESSION" ] || allow
+# 長く更新されていない run は古い active とみなして対象にしない（checkpoint abandon で解除する）。
+[ -z "$(find "$STATE" -mmin +"$TTL_MINUTES" 2>/dev/null)" ] || allow
+
+TARGET=$(field target)
+RUN_ID=$(field active)
+NOTES=$(printf '%s\n' "$CHECK" | sed -n 's/^note=/- /p')
+
+if [ "$(field mismatch)" = "1" ]; then
+  warn "実装 run（${TARGET}, run ${RUN_ID}）の checkpoint が現在の作業と一致しないため、完了前確認をしていません。
+$NOTES"
+fi
+
+case "$STAGE" in
+  done | blocked) allow ;;
+esac
+
+# ---------------------------------------------------------------- 未完了: 繰り返しを抑えて block する
+
+HOOK_FILE="$(dirname "$STATE")/stop-hook"
+SIGNATURE=$(printf '%s\n%s\n%s\n' "$STAGE" "$NOTES" "$(field fingerprint)" | git hash-object --stdin)
+BLOCKS=$(sed -n 's/^blocks=//p' "$HOOK_FILE" 2>/dev/null | head -n 1)
+LAST=$(sed -n 's/^last=//p' "$HOOK_FILE" 2>/dev/null | head -n 1)
+case "$BLOCKS" in "" | *[!0-9]*) BLOCKS=0 ;; esac
+# 新しいターン（stop_hook_active=false）では数え直す。
+[ "$HOOK_ACTIVE" = "true" ] || BLOCKS=0
+
+SUMMARY="実装 run（${TARGET}, run ${RUN_ID}）は stage=${STAGE} で、完了（done）していません。
+${NOTES:+$NOTES
+}次の作業: $(field next)"
+
+if [ "$HOOK_ACTIVE" = "true" ] && { [ "$SIGNATURE" = "$LAST" ] || [ "$BLOCKS" -ge "$MAX_BLOCKS" ]; }; then
+  warn "$SUMMARY
+同じ状態で繰り返し止めないため、未完了のまま停止します。"
+fi
+
+printf 'blocks=%s\nlast=%s\n' "$((BLOCKS + 1))" "$SIGNATURE" >"$HOOK_FILE.tmp.$$" && mv "$HOOK_FILE.tmp.$$" "$HOOK_FILE" ||
+  hook_error "block 回数を記録できません"
+
+REASON="$SUMMARY
+続けられるなら次の作業を進めてください。人の判断が必要・対応できない場合は .claude/scripts/checkpoint block \"<理由>\" \"<次に必要な判断>\" で記録してから止まってください。"
+printf '{"decision": "block", "reason": %s}\n' "$(json_str "$REASON")"
+exit 0
