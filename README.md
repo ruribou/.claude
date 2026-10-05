@@ -22,7 +22,7 @@ git clone git@github.com:ruribou/.claude.git .claude
 ```
 .claude/
 ├── README.md              このファイル
-├── settings.json          共有してよい権限設定（git / gh 中心の最小許可）
+├── settings.json          共有してよい権限設定（git / gh を許可し、範囲外の操作を deny、git-guard Hook を登録）
 ├── settings.local.json    ユーザーローカル設定（共有しない / .gitignore 推奨）
 ├── review-patterns.md     言語非依存のレビュー観点チェックリスト
 ├── verify.conf.example    検証アダプター設定の例（プロジェクト側で verify.conf にコピー）
@@ -36,6 +36,8 @@ git clone git@github.com:ruribou/.claude.git .claude
 │   ├── pr-create.md       /pr-create    PR 作成
 │   └── clean-branch.md    /clean-branch マージ済みブランチ整理
 ├── scripts/
+│   ├── git-guard          git / gh を実行直前の状態と照合する Hook
+│   ├── git-guard.md       自律実行の判断基準・停止条件・判定表
 │   ├── verify             検証の共通入口（明示した検証の実行と証跡記録）
 │   └── verify.md          アダプター設定・結果・証跡の仕様
 └── skills/
@@ -80,6 +82,36 @@ cp .claude/verify.conf.example .claude/verify.conf   # check 行を書く
 - **タスクドキュメントの置き場**: `docs/tasks/{kebab-case}.md`。ディレクトリが無ければエージェントが作成する
 - **レビュー観点**: 言語固有のアンチパターンではなく、セキュリティ / 設計 / 正確性・並行性 / 規約 の 4 軸で抽象的に定義
 - **プロジェクト固有の知識**: `skills/SKILL.md` に追記して蓄積する。ここだけはプロジェクトごとに書き換える前提
+
+## 権限設定
+
+### 共有設定（`settings.json`）
+
+- `Bash(git:*)` と `Bash(gh:*)` を自動許可する。git / gh 以外のシェルコマンド（lint / test / build、ファイル操作など）は Claude Code の権限確認を経て実行される
+- 認証・秘密情報・repo 管理・個人設定を変える `gh` / `git` の一部は `permissions.deny` で拒否する
+- PreToolUse / PostToolUse に `scripts/git-guard` を登録し、git / gh を実行直前の状態（作業ツリー、remote の先端、PR の状態など）と照合する。通常の branch 作成・commit・push・rebase・期待 OID 付き `--force-with-lease`・条件を満たした PR の merge は止めず、変更や他者の commit を失う可能性があるときだけ止める
+- スラッシュコマンドの `allowed-tools` も `Bash` を無制限には指定せず、必要な `Bash(git:*)` / `Bash(gh:*)` に限定している
+
+判断基準・停止条件・判定表は [`scripts/git-guard.md`](scripts/git-guard.md)。Hook は `jq` を使う（無い場合は git / gh を含むコマンドを確認に回す）。
+
+### 追加の許可を置く場所
+
+| 置き場所 | 用途 | 共有 |
+| --- | --- | --- |
+| `.claude/settings.json` | プロジェクト全員に必要な許可（このテンプレート） | する |
+| `.claude/settings.local.json` | そのプロジェクトでの個人的な許可（`.gitignore` 済み） | しない |
+| `~/.claude/settings.json` | 全プロジェクト共通の個人的な許可 | しない |
+
+プロジェクト固有のビルド・テストコマンドなどは、共有が必要なら `settings.json` に、個人の好みなら `settings.local.json` に追記する。統合ブランチの名前が `main` / `master` / `develop` 以外なら、`settings.json` の `env` に `CLAUDE_GIT_GUARD_PROTECTED` を設定する。
+
+### 設定を有効にする際の確認手順
+
+1. Claude Code を起動して信頼ダイアログを承認し、`/permissions` と `/hooks` で有効な許可ルール・Hook とその出所（共有 / ローカル / ユーザー）を確認する（未信頼のワークスペースでは `permissions.allow` が無視される）
+2. 必要に応じて `claude --setting-sources project` で共有設定だけを読み込んだ状態で起動し、git / gh 以外のコマンドで確認が求められること、`git push --force` が git-guard に止められることを確かめる
+
+### 注意
+
+この権限設定と git-guard は、Claude Code が確認なしに実行できる操作の範囲と、その直前の状態確認を調整するものであり、OS レベルの隔離（サンドボックス）や、悪意あるコード・プロンプトインジェクションに対する完全な防御を保証するものではない。git-guard はシェルの完全な構文解析ではなく、解析できない形は確認に回すが、すべての迂回を防げるとは限らない。
 
 ## カスタマイズ
 
