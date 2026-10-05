@@ -25,6 +25,7 @@ git clone git@github.com:ruribou/.claude.git .claude
 ├── settings.json          共有してよい権限設定（git / gh を許可し、範囲外の操作を deny、git-guard Hook を登録）
 ├── settings.local.json    ユーザーローカル設定（共有しない / .gitignore 推奨）
 ├── review-patterns.md     言語非依存のレビュー観点チェックリスト
+├── verify.conf.example    検証アダプター設定の例（プロジェクト側で verify.conf にコピー）
 ├── agents/
 │   ├── task-planner.md    対話ヒアリング → 実装計画ドキュメント作成
 │   └── implementer.md     実装計画に沿ってステップ実行
@@ -36,9 +37,12 @@ git clone git@github.com:ruribou/.claude.git .claude
 │   └── clean-branch.md    /clean-branch マージ済みブランチ整理
 ├── scripts/
 │   ├── git-guard          git / gh を実行直前の状態と照合する Hook
-│   └── git-guard.md       自律実行の判断基準・停止条件・判定表
+│   ├── git-guard.md       自律実行の判断基準・停止条件・判定表
+│   ├── verify             検証の共通入口（明示した検証の実行と証跡記録）
+│   └── verify.md          アダプター設定・結果・証跡の仕様
 └── skills/
-    └── SKILL.md           プロジェクト固有トラブルシュート置き場（テンプレート）
+    ├── SKILL.md           プロジェクト固有トラブルシュート置き場（テンプレート）
+    └── verify/SKILL.md    /verify  検証を手動実行して結果を報告
 ```
 
 ## 想定ワークフロー
@@ -55,11 +59,25 @@ git clone git@github.com:ruribou/.claude.git .claude
 
 補助コマンド:
 
+- `/verify` — プロジェクトが明示した検証を実行し、現在の差分に結び付いた証跡を残す
 - `/clean-branch` — マージ済みのローカルブランチを安全に整理する
+
+## 検証の設定
+
+検証コマンドは推測せず、プロジェクト側で明示する。
+
+```bash
+cp .claude/verify.conf.example .claude/verify.conf   # check 行を書く
+.claude/scripts/verify suggest                       # 候補の表示だけ（実行しない）
+.claude/scripts/verify run                           # 0=PASS 1=FAIL 2=BLOCKED
+.claude/scripts/verify status                        # 最新の証跡が現在の差分で有効か
+```
+
+証跡とログは `<git-dir>/claude-verify/` に置かれ、コミットや送信はされない。`/start-with-plan`・`/code-review`・`/pr-create` はこの共通入口を使う。詳細は [`scripts/verify.md`](scripts/verify.md)。
 
 ## 設計方針
 
-- **言語非依存**: TypeScript / React / Python / Go / Rust など、どのスタックでも動くように書かれている。検証コマンド（lint / type check / test / build）は `package.json` / `Makefile` / `justfile` / `Cargo.toml` / `pyproject.toml` 等から自動検出する
+- **言語非依存**: TypeScript / React / Python / Go / Rust など、どのスタックでも動くように書かれている。検証コマンド（lint / type check / test / build）はプロジェクト側の `.claude/verify.conf` で明示し、`scripts/verify` が実行する。自動検出は初回設定の候補提示（`verify suggest`）にとどめる
 - **ブランチ運用**: `develop` → `main` の 2 段階を前提にベースブランチを自動検出する。`develop` が無ければ `main` を使う
 - **タスクドキュメントの置き場**: `docs/tasks/{kebab-case}.md`。ディレクトリが無ければエージェントが作成する
 - **レビュー観点**: 言語固有のアンチパターンではなく、セキュリティ / 設計 / 正確性・並行性 / 規約 の 4 軸で抽象的に定義

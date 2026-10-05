@@ -1,6 +1,6 @@
 ---
 description: PRを作成する
-allowed-tools: [Read, Grep, Glob, "Bash(git:*)", "Bash(gh:*)"]
+allowed-tools: [Read, Grep, Glob, "Bash(git:*)", "Bash(gh:*)", "Bash(.claude/scripts/verify:*)"]
 ---
 
 現在のブランチの変更内容から Pull Request を作成する。
@@ -14,9 +14,9 @@ allowed-tools: [Read, Grep, Glob, "Bash(git:*)", "Bash(gh:*)"]
    - 所有範囲が判断できない変更があれば、コミットせず利用者に確認する
 3. ベースブランチを特定する（`develop` → `main` の順で存在するものを使う。以降 `<base>`）
 4. `git diff origin/<base>...HEAD` でベースブランチからの差分を確認する
-5. プロジェクトに静的検査コマンド（lint / type check 等）があれば実行する
-   - `package.json` / `Makefile` / `justfile` / `Cargo.toml` / `pyproject.toml` 等から検出する
-   - 警告・エラーがあれば PR 作成を中断し修正する
+5. `.claude/scripts/verify status` で現在の差分に対する検証証跡を確認する。`VALID` でなければ `.claude/scripts/verify run` を実行する
+   - 結果が `PASS` でなければ（`FAIL` / `BLOCKED`）PR 作成を中断し、理由を報告する
+   - 検証コマンドを manifest から推測して独自に実行しない
 6. 変更内容を分析し、PR のタイトルとサマリを作成する
 7. `git fetch` してリモートの作業ブランチとの差を確認し、push する
    - 未 push なら `git push -u origin <branch>`

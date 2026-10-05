@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+# verify — プロジェクトが明示した検証だけを実行し、検証対象スナップショットに結び付いた証跡を残す。
+# 仕様: scripts/verify.md（配置後は .claude/scripts/verify.md）
+# bash 3.2 互換を保つ（macOS 標準 bash で動かすため）。
+
+set -o pipefail
+
+SCHEMA="claude-verify/v1"
+EXCERPT_LINES=20
+
+usage() {
+  cat <<'EOF'
+usage: verify <command> [--config <path>]
+
+commands:
+  run          設定済みの検証をすべて実行し、証跡を記録する
+               exit: 0=PASS 1=FAIL 2=BLOCKED
+  status       最新の証跡が現在のスナップショットで有効な PASS か判定する
+               exit: 0=VALID 1=STALE / NOT_PASS / NONE
+  suggest      初回設定用に検証コマンドの候補を表示する（実行はしない）
+  fingerprint  現在のスナップショットの構成要素を表示する
+
+environment:
+  CLAUDE_VERIFY_CONFIG     アダプター設定のパス（既定: <repo>/.claude/verify.conf）
+  CLAUDE_VERIFY_STATE_DIR  証跡・ログの保存先（既定: <git-dir>/claude-verify）
+EOF
+}
+
+die_usage() {
+  printf 'verify: %s\n' "$1" >&2
+  usage >&2
+  exit 64
+}
+
+json_str() {
+  local s
+  s=$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  printf '"%s"' "$s"
+}
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+hash_stdin() { git -C "$ROOT" hash-object --stdin; }
+
+is_safe_relpath() {
+  case "$1" in
+    "" | /* | .. | ../* | */.. | */../*) return 1 ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------- setup
+
+COMMAND=""
+CONFIG="${CLAUDE_VERIFY_CONFIG:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --config) [ $# -ge 2 ] || die_usage "--config requires a path"; CONFIG="$2"; shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    -*) die_usage "unknown option: $1" ;;
+    *) [ -z "$COMMAND" ] || die_usage "unexpected argument: $1"; COMMAND="$1"; shift ;;
+  esac
+done
+[ -n "$COMMAND" ] || COMMAND="run"
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  printf 'verify: git リポジトリ内で実行してください\n' >&2
+  exit 2
+}
+[ -n "$CONFIG" ] || CONFIG="$ROOT/.claude/verify.conf"
+case "$CONFIG" in /*) ;; *) CONFIG="$PWD/$CONFIG" ;; esac
+
+STATE_DIR="${CLAUDE_VERIFY_STATE_DIR:-}"
+if [ -z "$STATE_DIR" ]; then
+  STATE_DIR=$(git rev-parse --path-format=absolute --git-path claude-verify 2>/dev/null) ||
+    STATE_DIR="$(cd "$(git rev-parse --git-dir)" && pwd)/claude-verify"
+fi
+case "$STATE_DIR" in /*) ;; *) STATE_DIR="$PWD/$STATE_DIR" ;; esac
+
+# ---------------------------------------------------------------- config
+
+# 設定は宣言として読むだけで、eval / source / シェル展開はしない。
+CHECK_IDS=()
+CHECK_CWDS=()
+CHECK_ARGVS=()
+INPUTS=()
+CONFIG_STATE=""   # ok | missing | invalid
+CONFIG_ERROR=""
+
+load_config() {
+  CHECK_IDS=(); CHECK_CWDS=(); CHECK_ARGVS=(); INPUTS=()
+  if [ ! -f "$CONFIG" ]; then
+    CONFIG_STATE="missing"
+    return
+  fi
+  CONFIG_STATE="ok"
+  local lineno=0 line directive id cwd i existing
+  local -a tok
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    read -r -a tok <<<"$line"
+    [ ${#tok[@]} -gt 0 ] || continue
+    case "${tok[0]}" in \#*) continue ;; esac
+    directive="${tok[0]}"
+    case "$directive" in
+      check)
+        id="${tok[1]:-}"
+        cwd="${tok[2]:-}"
+        if ! printf '%s' "$id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*$'; then
+          CONFIG_STATE="invalid"; CONFIG_ERROR="line $lineno: check の識別子が不正です"; return
+        fi
+        for existing in ${CHECK_IDS[@]+"${CHECK_IDS[@]}"}; do
+          if [ "$existing" = "$id" ]; then
+            CONFIG_STATE="invalid"; CONFIG_ERROR="line $lineno: check '$id' が重複しています"; return
+          fi
+        done
+        if ! is_safe_relpath "$cwd"; then
+          CONFIG_STATE="invalid"; CONFIG_ERROR="line $lineno: check '$id' の作業ディレクトリはリポジトリ内の相対パスで指定してください"; return
+        fi
+        local argv=""
+        i=3
+        while [ $i -lt ${#tok[@]} ]; do
+          argv="$argv${argv:+ }${tok[$i]}"
+          i=$((i + 1))
+        done
+        CHECK_IDS+=("$id"); CHECK_CWDS+=("$cwd"); CHECK_ARGVS+=("$argv")
+        ;;
+      input)
+        if [ ${#tok[@]} -ne 2 ] || ! is_safe_relpath "${tok[1]}"; then
+          CONFIG_STATE="invalid"; CONFIG_ERROR="line $lineno: input はリポジトリ内の相対パスを 1 つ指定してください"; return
+        fi
+        INPUTS+=("${tok[1]}")
+        ;;
+      *)
+        CONFIG_STATE="invalid"; CONFIG_ERROR="line $lineno: 不明なディレクティブ '$directive'"; return
+        ;;
+    esac
+  done <"$CONFIG"
+}
+
+# ---------------------------------------------------------------- snapshot
+
+# パスごとに「種別 モード ハッシュ パス」を 1 行で出す。内容そのものは出さない。
+describe_path() {
+  local rel="$1" abs="$ROOT/$1" mode
+  if [ -L "$abs" ]; then
+    printf 'link - %s %s\n' "$(readlink "$abs" | hash_stdin)" "$rel"
+  elif [ -d "$abs" ]; then
+    printf 'dir - - %s\n' "$rel"
+  elif [ -f "$abs" ]; then
+    mode=644; [ -x "$abs" ] && mode=755
+    printf 'file %s %s %s\n' "$mode" "$(git -C "$ROOT" hash-object --no-filters -- "$rel")" "$rel"
+  else
+    printf 'missing - - %s\n' "$rel"
+  fi
+}
+
+state_rel_prefix() {
+  case "$STATE_DIR/" in
+    "$ROOT"/*) printf '%s/' "${STATE_DIR#"$ROOT"/}" ;;
+  esac
+}
+
+list_untracked() {
+  local p skip
+  skip=$(state_rel_prefix)
+  git -C "$ROOT" ls-files -z --others --exclude-standard | while IFS= read -r -d '' p; do
+    if [ -n "$skip" ]; then
+      case "$p" in "$skip"*) continue ;; esac
+    fi
+    describe_path "${p%/}"
+  done
+}
+
+list_inputs() {
+  local p f
+  for p in ${INPUTS[@]+"${INPUTS[@]}"}; do
+    if [ -d "$ROOT/$p" ] && [ ! -L "$ROOT/$p" ]; then
+      printf 'tree - - %s\n' "$p"
+      (cd "$ROOT" && find "$p" \( -type f -o -type l \) -print) | LC_ALL=C sort | while IFS= read -r f; do
+        describe_path "$f"
+      done
+    else
+      describe_path "$p"
+    fi
+  done
+}
+
+SNAP_HEAD=""; SNAP_STAGED=""; SNAP_UNSTAGED=""; SNAP_UNTRACKED=""; SNAP_INPUTS=""; SNAP_CONFIG=""
+SNAP_FINGERPRINT=""
+
+compute_snapshot() {
+  local diff_opts="--binary --no-color --no-ext-diff --no-textconv --full-index"
+  SNAP_HEAD=$(git -C "$ROOT" rev-parse --verify -q HEAD 2>/dev/null) || SNAP_HEAD="unborn"
+  # shellcheck disable=SC2086
+  SNAP_STAGED=$(git -C "$ROOT" diff --cached $diff_opts | hash_stdin)
+  # shellcheck disable=SC2086
+  SNAP_UNSTAGED=$(git -C "$ROOT" diff $diff_opts | hash_stdin)
+  SNAP_UNTRACKED=$(list_untracked | hash_stdin)
+  SNAP_INPUTS=$(list_inputs | hash_stdin)
+  if [ -f "$CONFIG" ]; then
+    SNAP_CONFIG=$(git -C "$ROOT" hash-object --no-filters -- "$CONFIG")
+  else
+    SNAP_CONFIG="missing"
+  fi
+  SNAP_FINGERPRINT=$(printf 'head %s\nstaged %s\nunstaged %s\nuntracked %s\ninputs %s\nconfig %s\n' \
+    "$SNAP_HEAD" "$SNAP_STAGED" "$SNAP_UNSTAGED" "$SNAP_UNTRACKED" "$SNAP_INPUTS" "$SNAP_CONFIG" | hash_stdin)
+}
+
+snapshot_json() {
+  printf '{"fingerprint": %s, "head": %s, "staged": %s, "unstaged": %s, "untracked": %s, "inputs": %s, "config": %s}' \
+    "$(json_str "$SNAP_FINGERPRINT")" "$(json_str "$SNAP_HEAD")" "$(json_str "$SNAP_STAGED")" \
+    "$(json_str "$SNAP_UNSTAGED")" "$(json_str "$SNAP_UNTRACKED")" "$(json_str "$SNAP_INPUTS")" \
+    "$(json_str "$SNAP_CONFIG")"
+}
+
+# ---------------------------------------------------------------- run
+
+executable_exists() {
+  local dir="$1" cmd="$2"
+  case "$cmd" in
+    /*) [ -f "$cmd" ] && [ -x "$cmd" ] ;;
+    */*) [ -f "$dir/$cmd" ] && [ -x "$dir/$cmd" ] ;;
+    *) (cd "$dir" && type -P -- "$cmd" >/dev/null 2>&1) ;;
+  esac
+}
+
+cmd_run() {
+  load_config
+  compute_snapshot
+  local before_json fp_before started run_id run_dir
+  before_json=$(snapshot_json)
+  fp_before="$SNAP_FINGERPRINT"
+  started=$(now_utc)
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  run_dir="$STATE_DIR/runs/$run_id"
+  mkdir -p "$run_dir" || { printf 'verify: 証跡ディレクトリを作成できません: %s\n' "$run_dir" >&2; exit 2; }
+
+  local overall="PASS" reason="ok" checks_json="" n=${#CHECK_IDS[@]} i
+  local -a results=() reasons=() exits=() logs=()
+
+  if [ "$CONFIG_STATE" = "missing" ]; then
+    overall="BLOCKED"; reason="config_missing"
+  elif [ "$CONFIG_STATE" = "invalid" ]; then
+    overall="BLOCKED"; reason="config_invalid"
+  elif [ "$n" -eq 0 ]; then
+    overall="BLOCKED"; reason="no_checks"
+  else
+    local id dir res why code log
+    local -a argv
+    i=0
+    while [ $i -lt "$n" ]; do
+      id="${CHECK_IDS[$i]}"
+      dir="$ROOT/${CHECK_CWDS[$i]}"
+      read -r -a argv <<<"${CHECK_ARGVS[$i]}"
+      log="runs/$run_id/$id.log"
+      code=""
+      if [ ${#argv[@]} -eq 0 ]; then
+        res="BLOCKED"; why="command_missing"; log=""
+      elif [ ! -d "$dir" ]; then
+        res="BLOCKED"; why="cwd_missing"; log=""
+      elif ! executable_exists "$dir" "${argv[0]}"; then
+        res="BLOCKED"; why="executable_not_found"; log=""
+      else
+        (cd "$dir" && exec "${argv[@]}") </dev/null >"$STATE_DIR/$log" 2>&1
+        code=$?
+        if [ "$code" -eq 0 ]; then res="PASS"; why="ok"; else res="FAIL"; why="nonzero_exit"; fi
+      fi
+      results+=("$res"); reasons+=("$why"); exits+=("$code"); logs+=("$log")
+      i=$((i + 1))
+    done
+
+    overall="PASS"; reason="ok"
+    for res in "${results[@]}"; do
+      if [ "$res" = "FAIL" ]; then overall="FAIL"; reason="check_failed"; break; fi
+    done
+    if [ "$overall" = "PASS" ]; then
+      for res in "${results[@]}"; do
+        if [ "$res" = "BLOCKED" ]; then overall="BLOCKED"; reason="check_blocked"; break; fi
+      done
+    fi
+  fi
+
+  # 実行中に検証対象が変わった結果は、どの入力に対する結果か確定できないため成功扱いしない。
+  compute_snapshot
+  local after_json
+  after_json=$(snapshot_json)
+  if [ "$SNAP_FINGERPRINT" != "$fp_before" ]; then
+    overall="BLOCKED"; reason="inputs_changed_during_run"
+  fi
+
+  i=0
+  while [ $i -lt ${#results[@]} ]; do
+    checks_json="$checks_json${checks_json:+,
+    }{\"id\": $(json_str "${CHECK_IDS[$i]}"), \"cwd\": $(json_str "${CHECK_CWDS[$i]}"), \"result\": $(json_str "${results[$i]}"), \"reason\": $(json_str "${reasons[$i]}"), \"exit_code\": ${exits[$i]:-null}, \"log\": $(if [ -n "${logs[$i]}" ]; then json_str "${logs[$i]}"; else printf null; fi)}"
+    i=$((i + 1))
+  done
+
+  local evidence="$run_dir/evidence.json"
+  {
+    printf '{\n'
+    printf '  "schema": %s,\n' "$(json_str "$SCHEMA")"
+    printf '  "run_id": %s,\n' "$(json_str "$run_id")"
+    printf '  "started_at": %s,\n' "$(json_str "$started")"
+    printf '  "finished_at": %s,\n' "$(json_str "$(now_utc)")"
+    printf '  "config": %s,\n' "$(json_str "${CONFIG#"$ROOT"/}")"
+    printf '  "config_error": %s,\n' "$(if [ -n "$CONFIG_ERROR" ]; then json_str "$CONFIG_ERROR"; else printf null; fi)"
+    printf '  "result": %s,\n' "$(json_str "$overall")"
+    printf '  "reason": %s,\n' "$(json_str "$reason")"
+    printf '  "snapshot": %s,\n' "$before_json"
+    printf '  "snapshot_after": %s,\n' "$after_json"
+    printf '  "checks": [%s%s%s]\n' "${checks_json:+
+    }" "$checks_json" "${checks_json:+
+  }"
+    printf '}\n'
+  } >"$evidence.tmp" && mv "$evidence.tmp" "$evidence"
+
+  {
+    printf 'schema=%s\n' "$SCHEMA"
+    printf 'run_id=%s\n' "$run_id"
+    printf 'result=%s\n' "$overall"
+    printf 'reason=%s\n' "$reason"
+    printf 'fingerprint=%s\n' "$fp_before"
+    printf 'evidence=%s\n' "$evidence"
+  } >"$STATE_DIR/latest.tmp.$$" && mv "$STATE_DIR/latest.tmp.$$" "$STATE_DIR/latest"
+
+  # 画面には段階別の結果・理由・短い失敗抜粋・証跡の位置だけを返す。
+  i=0
+  while [ $i -lt ${#results[@]} ]; do
+    printf '%-7s %s (%s%s)\n' "${results[$i]}" "${CHECK_IDS[$i]}" "${reasons[$i]}" "${exits[$i]:+, exit ${exits[$i]}}"
+    if [ "${results[$i]}" = "FAIL" ] && [ -n "${logs[$i]}" ]; then
+      tail -n "$EXCERPT_LINES" "$STATE_DIR/${logs[$i]}" | sed 's/^/    | /'
+    fi
+    i=$((i + 1))
+  done
+  [ -z "$CONFIG_ERROR" ] || printf 'config: %s\n' "$CONFIG_ERROR"
+  if [ "$CONFIG_STATE" = "missing" ]; then
+    printf 'config: %s がありません。候補は `verify suggest` で確認できます（候補は自動実行しません）\n' "${CONFIG#"$ROOT"/}"
+  fi
+  printf 'RESULT  %s (%s)\n' "$overall" "$reason"
+  printf 'evidence: %s\n' "$evidence"
+
+  case "$overall" in
+    PASS) return 0 ;;
+    FAIL) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- status
+
+read_latest() {
+  local key="$1"
+  sed -n "s/^$key=//p" "$STATE_DIR/latest" | head -n 1
+}
+
+cmd_status() {
+  if [ ! -f "$STATE_DIR/latest" ]; then
+    printf 'NONE     証跡がありません。verify run を実行してください\n'
+    return 1
+  fi
+  load_config
+  compute_snapshot
+  local result reason fingerprint evidence
+  result=$(read_latest result)
+  reason=$(read_latest reason)
+  fingerprint=$(read_latest fingerprint)
+  evidence=$(read_latest evidence)
+  if [ "$fingerprint" != "$SNAP_FINGERPRINT" ]; then
+    printf 'STALE    最新の証跡（%s）は現在のスナップショットと一致しません\n' "$result"
+    printf 'evidence: %s\n' "$evidence"
+    return 1
+  fi
+  if [ "$result" != "PASS" ]; then
+    printf 'NOT_PASS 現在のスナップショットの結果は %s (%s) です\n' "$result" "$reason"
+    printf 'evidence: %s\n' "$evidence"
+    return 1
+  fi
+  printf 'VALID    現在のスナップショットに対する PASS の証跡があります\n'
+  printf 'evidence: %s\n' "$evidence"
+  return 0
+}
+
+# ---------------------------------------------------------------- suggest
+
+cmd_suggest() {
+  local found=0
+  candidate() { found=1; printf '# check %s\n' "$1"; }
+  printf '# verify.conf の候補（自動検出）。内容を確認してから # を外して %s に書いてください。\n' "${CONFIG#"$ROOT"/}"
+  printf '# 書式: check <id> <作業ディレクトリ> <argv...> / input <追加入力パス>\n'
+  if [ -f "$ROOT/package.json" ]; then
+    local pm=npm
+    [ -f "$ROOT/pnpm-lock.yaml" ] && pm=pnpm
+    [ -f "$ROOT/yarn.lock" ] && pm=yarn
+    [ -f "$ROOT/bun.lockb" ] || [ -f "$ROOT/bun.lock" ] && pm=bun
+    local script
+    for script in lint typecheck test build; do
+      if grep -Eq "\"$script\"[[:space:]]*:" "$ROOT/package.json"; then
+        candidate "$script . $pm run $script"
+      fi
+    done
+  fi
+  if [ -f "$ROOT/Makefile" ]; then
+    local target
+    for target in lint test build; do
+      grep -Eq "^$target:" "$ROOT/Makefile" && candidate "$target . make $target"
+    done
+  fi
+  if [ -f "$ROOT/justfile" ]; then
+    local recipe
+    for recipe in lint test build; do
+      grep -Eq "^$recipe:" "$ROOT/justfile" && candidate "$recipe . just $recipe"
+    done
+  fi
+  if [ -f "$ROOT/Cargo.toml" ]; then
+    candidate "lint . cargo clippy --all-targets -- -D warnings"
+    candidate "test . cargo test"
+  fi
+  if [ -f "$ROOT/go.mod" ]; then
+    candidate "vet . go vet ./..."
+    candidate "test . go test ./..."
+  fi
+  if [ -f "$ROOT/pyproject.toml" ]; then
+    candidate "test . python -m pytest"
+  fi
+  [ "$found" -eq 1 ] || printf '# 候補は見つかりませんでした。検証用スクリプトを用意して check 行に書いてください。\n'
+  return 0
+}
+
+# ---------------------------------------------------------------- fingerprint
+
+cmd_fingerprint() {
+  load_config
+  compute_snapshot
+  printf 'fingerprint %s\nhead %s\nstaged %s\nunstaged %s\nuntracked %s\ninputs %s\nconfig %s\n' \
+    "$SNAP_FINGERPRINT" "$SNAP_HEAD" "$SNAP_STAGED" "$SNAP_UNSTAGED" "$SNAP_UNTRACKED" "$SNAP_INPUTS" "$SNAP_CONFIG"
+}
+
+case "$COMMAND" in
+  run) cmd_run ;;
+  status) cmd_status ;;
+  suggest) cmd_suggest ;;
+  fingerprint) cmd_fingerprint ;;
+  *) die_usage "unknown command: $COMMAND" ;;
+esac
