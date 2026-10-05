@@ -1,5 +1,5 @@
 ---
-description: 対話形式でタスクを作成する
+description: （任意）対話形式で実装計画ドキュメントを作成する。実装は行わない
 allowed-tools: [AskUserQuestion, Read, Write, Glob, Grep]
 argument-hint: <やりたいこと>
 ---
@@ -19,11 +19,10 @@ argument-hint: <やりたいこと>
 
 ## ワークフロー
 
-このコマンドは計画の作成までを行う。実装・検証・レビュー・PR の手順は `.claude/skills/implement-issue/SKILL.md` が正本で、ここでは持たない。
+このコマンドは実装前の相談・計画ファイルの作成だけを行う任意の補助入口で、Issue 実装の必須の前段ではない。実装・検証・レビュー・PR の手順は `.claude/skills/implement-issue/SKILL.md` が正本で、ここでは持たない。
 
 ```
-/create-task "やりたいこと"     # 計画作成（このコマンド）→ docs/tasks/*.md
+/create-task "やりたいこと"            # 計画作成（このコマンド）→ docs/tasks/*.md
 ↓
-/start-with-plan <ファイル名>   # 計画を入力に /implement-issue と同じフローで
-                                # 実装 → verify → 独立レビュー → commit / push / PR
+/implement-issue --plan <ファイル名>   # 計画を入力に、実装 → verify → 独立レビュー → commit / push / PR
 ```

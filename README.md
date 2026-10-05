@@ -32,12 +32,11 @@ git clone git@github.com:ruribou/.claude.git .claude
 │   ├── implementer.md     実装フローから 1 単位を受け取り実装・コミット
 │   └── reviewer.md        読み取り専用レビュー（Read / Glob / Grep のみ）
 ├── commands/
-│   ├── create-task.md     /create-task  タスク（実装計画）作成
-│   ├── start-with-plan.md /start-with-plan <path>  計画ファイルから実装フローを開始（互換入口）
-│   ├── code-review.md     /code-review  ブランチ差分の読み取り専用レビュー
-│   ├── review-issue.md    /review-issue <issue>  Issue の受入条件に対する読み取り専用レビュー
-│   ├── pr-create.md       /pr-create    PR 作成
-│   └── clean-branch.md    /clean-branch マージ済みブランチ整理
+│   ├── review-issue.md    /review-issue <issue>  Issue の受入条件に対する読み取り専用レビュー（補助）
+│   ├── create-task.md     /create-task  実装計画ファイルの作成だけ（任意）
+│   ├── clean-branch.md    /clean-branch マージ済みブランチ整理（任意の保守）
+│   ├── start-with-plan.md /start-with-plan <path>  互換入口 → /implement-issue --plan
+│   └── code-review.md     /code-review  互換入口 → /review-issue の手順を Issue 指定なしで
 ├── scripts/
 │   ├── checkpoint         実装フローの進行状態の保存・再開時の照合
 │   ├── checkpoint.md      段階・照合・保存先の仕様
@@ -58,9 +57,17 @@ git clone git@github.com:ruribou/.claude.git .claude
     └── verify/SKILL.md    /verify  検証を手動実行して結果を報告
 ```
 
-## 想定ワークフロー
+## 使い方
 
-普段の入口は `/implement-issue <issue番号>`。1 件の Issue を、仕様確認から PR まで進める。
+普段使う入口は `/implement-issue <issue番号>` の 1 つだけ。1 回の起動で、小さな Issue 1 件を仕様確認から PR 作成まで進める。検証・レビュー・PR 作成のための段階別コマンドを順番に手入力する必要はない。
+
+```
+/implement-issue 12
+```
+
+親（ロードマップ）Issue を渡した場合は子 Issue の一覧を示して止まる。1 件ずつ指定して実行する。
+
+### 実装フロー
 
 ```
 /implement-issue 12             # Issue の目的・受入条件・対象外を確認
@@ -70,13 +77,6 @@ git clone git@github.com:ruribou/.claude.git .claude
   └─ push → PR                  # 最終 commit の検証・レビュー後に push。--merge で条件を満たせば統合まで
 ```
 
-計画ファイルから始める場合:
-
-```
-/create-task "やりたいこと"     # task-planner が対話でヒアリング → docs/tasks/*.md を生成
-        ↓
-/start-with-plan <file>         # 上と同じフローを、計画ファイルを入力にして進める
-```
 
 - フローを進めるのはメイン側（Skill を実行している会話）。implementer → verify → reviewer を順に呼び、subagent から subagent は起動しない
 - 進行状態は `.claude/scripts/checkpoint` が worktree ごとのローカル checkpoint（`<git-dir>/claude-run/`）に保存する。中断後に同じコマンドを実行すると再開する
@@ -86,12 +86,39 @@ git clone git@github.com:ruribou/.claude.git .claude
 
 詳細は [`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md) と [`scripts/checkpoint.md`](scripts/checkpoint.md)。レビューは `/review-issue` と同じ `.claude/scripts/review` と `agents/reviewer.md` を使う。
 
-補助コマンド:
+### 中断・再開
+
+中断した場合も、同じ `/implement-issue <issue番号>` をもう一度実行する。checkpoint を照合して途中の段階から再開し、push 済みの commit や作成済みの PR は重複して作らない（既存の PR を更新する）。
+
+### 計画ファイルから始める（任意）
+
+Issue がない作業は、計画ファイルを入力にできる。
+
+```
+/create-task "やりたいこと"            # 任意: task-planner が対話でヒアリング → docs/tasks/*.md を生成（実装はしない）
+/implement-issue --plan <file>         # 計画ファイルを入力に、上と同じフローで PR まで進める
+```
+
+### 単独で確認したいとき（任意）
+
+通常のフローでは手動で実行する必要はない。必要なときだけ単独で使う。
 
 - `/verify` — プロジェクトが明示した検証を実行し、現在の差分に結び付いた証跡を残す（`/implement-issue` も同じ入口を使う）
-- `/review-issue <issue>` — Issue の受入条件に対して現在の差分を読み取り専用でレビューする（`/implement-issue` も同じ reviewer を使う）
-- `/code-review`・`/pr-create` — ブランチ差分のレビュー・PR 作成だけを単独で行う
-- `/clean-branch` — マージ済みのローカルブランチを安全に整理する
+- `/review-issue <issue>` — Issue の受入条件に対して現在の差分を読み取り専用でレビューする（`/implement-issue` も同じ reviewer を使う）。修正・コミットはしない
+- `/clean-branch` — マージ済みのローカルブランチを安全に整理する（開発フローとは別の保守操作）
+
+### 旧コマンドからの移行
+
+| 旧入口 | 現在の扱い | 代わりに使うもの・引数の差 |
+| --- | --- | --- |
+| `/start-with-plan <path>` | 互換入口（残す）。`docs/tasks/` の補完だけ行い、`/implement-issue --plan` の手順へ委譲する | `/implement-issue --plan <path>`。引数は同じ計画ファイルのパス。数字を渡しても Issue 番号としては扱わない |
+| `/code-review [-- <pathspec>]` | 互換入口（残す）。`/review-issue` の手順を Issue 指定なしで実行する。修正・コミットはしない | Issue に対するレビューは `/review-issue <issue>`。引数は同じ pathspec |
+| `/pr-create` | **廃止**（`commands/pr-create.md` を削除）。PR 作成は `/implement-issue` の公開段階（手順 8）に統合 | 対象 Issue の `/implement-issue <issue>` を再実行する。checkpoint から再開し、検証・レビューの証跡が最新の差分で有効な場合だけ push / PR 作成に進む。同じ branch の open PR があれば新規作成せず更新する。旧 `/pr-create` は引数なしで現在の branch を対象にしていたが、新しい入口は Issue 番号（または `--plan <path>`）が必須。対象の Issue / run を決められない場合は、推測で PR を作らず利用者に確認する |
+| `/create-task` | 任意の補助入口（残す）。計画ファイルを作るだけ | 次の手順は `/implement-issue --plan <file>` |
+| `/clean-branch` | 任意の保守入口（残す） | 変更なし |
+
+- 互換入口は旧名を残すための薄い委譲で、手順・状態を複製しない。将来の削除は別の変更として告知する
+- 導入先に `commands/pr-create.md` の私有コピーや `~/.claude/commands/` の同名コマンドがある場合、このテンプレートの更新では削除しない。不要なら利用者が削除する
 
 ## 検証の設定
 
@@ -104,11 +131,11 @@ cp .claude/verify.conf.example .claude/verify.conf   # check 行を書く
 .claude/scripts/verify status                        # 最新の証跡が現在の差分で有効か
 ```
 
-証跡とログは `<git-dir>/claude-verify/` に置かれ、コミットや送信はされない。`/implement-issue`（`/start-with-plan`）・`/code-review`・`/pr-create` はこの共通入口を使う。詳細は [`scripts/verify.md`](scripts/verify.md)。
+証跡とログは `<git-dir>/claude-verify/` に置かれ、コミットや送信はされない。`/implement-issue`（`/start-with-plan`）・`/review-issue`（`/code-review`）はこの共通入口を使う。詳細は [`scripts/verify.md`](scripts/verify.md)。
 
 ## レビュー
 
-`/review-issue <issue>` と `/code-review` は同じ `reviewer` エージェントを使う。reviewer は Read / Glob / Grep だけを持ち、修正・コミット・投稿をしない。
+`/implement-issue`・`/review-issue <issue>`・`/code-review` は同じ `reviewer` エージェントを使う。指摘の修正は reviewer ではなく実装側（`/implement-issue` の implementer）が行い、修正後は検証・レビューの証跡を取り直す。reviewer は Read / Glob / Grep だけを持ち、修正・コミット・投稿をしない。
 
 1. 呼び出し側が `verify status`（必要なら `verify run`）で検証証跡を用意する
 2. `.claude/scripts/review build` が base / head・差分（未追跡の新規ファイルを含む）・検証証跡・Issue 本文を packet にまとめる。Issue 本文と差分はデータとして扱う
@@ -179,7 +206,7 @@ cp .claude/verify.conf.example .claude/verify.conf   # check 行を書く
 
 | 区分 | 対象 | いつ読まれるか |
 | --- | --- | --- |
-| 常時ロード | ルート `CLAUDE.md`、各 Skill の `name` / `description`（`disable-model-invocation: true` の `verify` を除く） | セッション開始時から常に文脈に入る |
+| 常時ロード | ルート `CLAUDE.md`、各 Skill の `name` / `description`（`disable-model-invocation: true` の `implement-issue` / `verify` を除く） | セッション開始時から常に文脈に入る |
 | 必要時に読む手順 | `skills/project-knowledge/SKILL.md` 本文 | description に合うタスク（エラー調査等）で Claude が呼び出したとき、または `/project-knowledge` 実行時。`reviewer` エージェントは Skill を使わず、`review-patterns.md` の案内に従って索引を直接読む |
 | 必要時に読む知識本文 | `references/index.md` → 条件に合う `references/*.md` だけ | Skill の手順（または reviewer）の中で、索引の「読む条件」に合うものだけ |
 | 結果ログ | `docs/tasks/*.md`、検証証跡（`<git-dir>/claude-verify/`）、レビュー結果（`<git-dir>/claude-review/`）、PR 本文 | 自動では読まれない。コマンドやスクリプトが明示的に参照したものだけ |

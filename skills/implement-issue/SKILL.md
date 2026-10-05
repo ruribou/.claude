@@ -22,7 +22,7 @@ allowed-tools:
 
 # /implement-issue
 
-1 件の Issue または実装計画ファイル（`/start-with-plan` から）を対象に、実装フローを進める **手順の正本**。`/start-with-plan` と `agents/implementer.md` はこの手順を参照し、手順を重複して持たない。
+1 件の Issue または実装計画ファイルを対象に、実装フローを進める **手順の正本**。普段使う唯一の標準的な実装入口で、起動後は段階別のスラッシュコマンドを手動で挟まずに PR 作成（`--merge` 指定時は統合）まで進める。互換入口 `/start-with-plan` と `agents/implementer.md` はこの手順を参照し、手順を重複して持たない。旧 `/pr-create` の PR 作成は手順 8 に統合されている。
 
 このフローを進めるのはメイン側（この Skill を実行している会話）。各ステップでは次のものを順に呼び出す。subagent から別の subagent は起動しない。
 
@@ -40,7 +40,7 @@ allowed-tools:
 | --- | --- | --- |
 | 正の整数 1 件（先頭の `#` は外す） | `6` / `#6` | Issue モード |
 | 上記に `--merge` を付ける | `6 --merge` | 条件を満たせば PR のマージまで進める |
-| `--plan <path>` | `--plan docs/tasks/add-x.md` | 計画モード（`/start-with-plan` から呼ばれる） |
+| `--plan <path>` | `--plan docs/tasks/add-x.md` | 計画モード（互換入口 `/start-with-plan <path>` も同じ） |
 
 - Issue 番号は `^[1-9][0-9]*$` に一致するものだけを受け付ける。複数の番号・URL・範囲を指定した場合は 1 件に絞るよう返す
 - Issue 番号や本文を shell コマンドの文字列に連結・評価しない。番号は検証済みの数字として引数にだけ使い、本文はファイル経由で扱う
@@ -195,7 +195,21 @@ checkpoint は権限や承認を保存しない。再開時の操作も、現在
      - `Closes #<n>`（Issue モード）
      - 受入条件ごとの結果と根拠（verify run_id、review_id、fixture）
      - 未確認事項
-   - 書式は `/pr-create` のフォーマットに従う
+   - `.github/pull_request_template.md` があればそれに従う。なければ次の書式にする（タイトルは 70 文字以内）
+     ```
+     ## 概要
+     <変更の目的と概要。Closes #<n>>
+
+     ## 細かい変更点
+     <具体的な変更点の箇条書き>
+
+     ## 受入条件と検証
+     <受入条件ごとの結果と根拠（verify run_id / review_id / fixture）>
+
+     ## 影響範囲・懸念点・未確認事項
+     <なければ「なし」>
+     ```
+   - `gh pr create -R <repo> --base <base> --head <branch> --title ... --body-file <run-dir>/pr-body.md` のように本文はファイルで渡す
 5. `checkpoint set pr=<番号>` を実行する
 
 ### 9. 統合する（`--merge` 指定時のみ）
