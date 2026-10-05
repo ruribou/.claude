@@ -39,6 +39,7 @@ allowed-tools: [Agent, Bash, Read, Grep, Glob]
 - プロジェクトで設定されている linter / formatter / 型チェッカーを実行し、警告・エラーを確認する
   - 実行コマンドは `package.json` / `Makefile` / `justfile` / `Cargo.toml` / `pyproject.toml` 等から検出する
 - 命名の明確さ、マジックナンバー、未使用コード、不要な import
+- `project-knowledge` Skill の索引にレビュー事例が登録されていれば、変更ファイルに該当するものだけを参照する
 
 5. 4つの観点の結果を統合し、以下の形式でレポートを出力する
 
