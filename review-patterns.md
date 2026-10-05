@@ -1,7 +1,7 @@
 # レビューパターン集
 
 過去のレビューから抽出した、レビュー時に注意すべき一般的なパターン。
-`reviewer` エージェント（`/review-issue` / `/code-review`）はこのファイルの観点で差分を評価する。判定基準と出力形式は `agents/reviewer.md` にある。
+`reviewer` エージェント（`/implement-issue` / `/review-issue` / `/code-review`）はこのファイルの観点で差分を評価する。判定基準と出力形式は `agents/reviewer.md` にある。
 リポジトリ固有の事例はここに追記せず `skills/project-knowledge/references/` に置く（README 参照）。`skills/project-knowledge/references/index.md` があれば、読む条件が変更ファイルに該当する参照だけを読む。
 
 観点は 4 軸にまとめられる。

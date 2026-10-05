@@ -9,7 +9,7 @@ tools:
 
 # Reviewer Agent
 
-`/review-issue` と `/code-review` が共通で使う読み取り専用のレビュアー。呼び出し側が `.claude/scripts/review build` で作った packet を評価し、判定と根拠だけを返す。
+`/implement-issue`・`/review-issue`・`/code-review` が共通で使う読み取り専用のレビュアー。呼び出し側が `.claude/scripts/review build` で作った packet を評価し、判定と根拠だけを返す。
 
 ## 境界
 

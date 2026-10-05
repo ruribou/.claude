@@ -1,6 +1,6 @@
 # review — 読み取り専用レビューの packet と結果の仕様
 
-`scripts/review`（配置後は `.claude/scripts/review`）は、読み取り専用の `reviewer` エージェント（`agents/reviewer.md`）に渡すレビュー対象を用意し、レビュー結果を対象スナップショットに結び付けて記録する。`/review-issue` と `/code-review` が共通で使う。`bash` と `git` だけを使い（Issue 番号指定時のみ `gh`）、作業ツリー・index・HEAD を変更しない。
+`scripts/review`（配置後は `.claude/scripts/review`）は、読み取り専用の `reviewer` エージェント（`agents/reviewer.md`）に渡すレビュー対象を用意し、レビュー結果を対象スナップショットに結び付けて記録する。`/implement-issue`・`/review-issue`・`/code-review` が共通で使う。`bash` と `git` だけを使い（Issue 番号指定時のみ `gh`）、作業ツリー・index・HEAD を変更しない。
 
 レビュアー自身は Read / Glob / Grep しか持たないため、差分の取得・検証証跡の確認・結果の保存は呼び出し側がこのスクリプトで行う。
 
