@@ -37,10 +37,8 @@ git clone git@github.com:ruribou/.claude.git .claude
 ├── scripts/
 │   ├── git-guard          git / gh を実行直前の状態と照合する Hook
 │   └── git-guard.md       自律実行の判断基準・停止条件・判定表
-├── skills/
-│   └── SKILL.md           プロジェクト固有トラブルシュート置き場（テンプレート）
-└── tests/
-    └── git-guard.test.sh  scripts/git-guard のテスト
+└── skills/
+    └── SKILL.md           プロジェクト固有トラブルシュート置き場（テンプレート）
 ```
 
 ## 想定ワークフロー
@@ -90,9 +88,8 @@ git clone git@github.com:ruribou/.claude.git .claude
 
 ### 設定を有効にする際の確認手順
 
-1. `bash .claude/tests/git-guard.test.sh` で、使い捨ての repo と bare remote に対する判定を確認する
-2. Claude Code を起動して信頼ダイアログを承認し、`/permissions` と `/hooks` で有効な許可ルール・Hook とその出所（共有 / ローカル / ユーザー）を確認する（未信頼のワークスペースでは `permissions.allow` が無視される）
-3. 必要に応じて `claude --setting-sources project` で共有設定だけを読み込んだ状態で起動し、git / gh 以外のコマンドで確認が求められること、`git push --force` が git-guard に止められることを確かめる
+1. Claude Code を起動して信頼ダイアログを承認し、`/permissions` と `/hooks` で有効な許可ルール・Hook とその出所（共有 / ローカル / ユーザー）を確認する（未信頼のワークスペースでは `permissions.allow` が無視される）
+2. 必要に応じて `claude --setting-sources project` で共有設定だけを読み込んだ状態で起動し、git / gh 以外のコマンドで確認が求められること、`git push --force` が git-guard に止められることを確かめる
 
 ### 注意
 
