@@ -41,7 +41,7 @@ argument-hint: "<issue> [-- <pathspec>...]"
 ## してはいけないこと
 
 - 指摘を修正する・コミットする・Issue / PR にコメントする・approve / merge する
-- 修正が必要な場合は、ユーザーの指示を受けて明示的な実装ステップ（`/start-with-plan` や個別の修正依頼）で行う。修正後は再度 `/review-issue` を実行する
+- 修正が必要な場合は、ユーザーの指示を受けて明示的な実装ステップ（`/implement-issue`・`/start-with-plan` や個別の修正依頼）で行う。修正後は再度 `/review-issue` を実行する
 
 ## 結果の鮮度
 

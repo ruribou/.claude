@@ -1,35 +1,35 @@
 ---
 description: 実装計画ドキュメントに基づいて実装を開始する
 allowed-tools:
-  [Agent, Read, Write, Edit, Grep, Glob, TaskCreate, TaskUpdate, "Bash(git:*)", "Bash(.claude/scripts/verify:*)"]
+  [
+    Agent,
+    AskUserQuestion,
+    Read,
+    Write,
+    Edit,
+    Grep,
+    Glob,
+    TaskCreate,
+    TaskUpdate,
+    "Bash(git:*)",
+    "Bash(gh:*)",
+    "Bash(.claude/scripts/verify:*)",
+    "Bash(.claude/scripts/review:*)",
+    "Bash(.claude/scripts/checkpoint:*)",
+  ]
 args: path
 ---
 
-指定された実装計画ドキュメントに基づき、implementer エージェントのワークフローで実装を進める。
+実装計画ドキュメントを入力として、`/implement-issue` と同じ実装フローを進める互換入口。手順はここに持たず、`.claude/skills/implement-issue/SKILL.md` を正本とする。
 
 ## 引数
 
 - `$ARGUMENTS`: 実装計画ドキュメントのパス（例: `docs/tasks/add-overlay-mode.md`）
-  - `docs/tasks/` を省略した場合は自動的に補完する
+  - `docs/tasks/` を省略した場合は自動的に補完する（`add-overlay-mode.md` → `docs/tasks/add-overlay-mode.md`）
+  - ファイルが無ければ、`docs/tasks/` の候補を示して終了する
 
-## ワークフロー
+## 手順
 
-1. 実装計画ドキュメント `$ARGUMENTS` を読み込む
-   - パスに `docs/tasks/` が含まれていなければ `docs/tasks/$ARGUMENTS` として読む
-2. ドキュメントの内容を把握し、実装ステップを TaskCreate で TODO リストとして作成する
-3. 各ステップを順番に実装する
-   - 既存コードへの影響を確認してから変更する
-   - プロジェクトの既存のコード規約・設計に倣う
-4. 各ステップ完了時に TaskUpdate でステータスを更新する
-5. 全ステップ完了後、`.claude/scripts/verify run` で検証する（implementer エージェントのワークフロー手順 5 と同じ扱い）
-   - `FAIL` は修正して再実行する。`BLOCKED` は理由を報告し、PASS として扱わない
-6. 適切な粒度でコミットする
-7. 完了報告を出力する
-
-## 全体フロー
-
-```
-/create-task → /start-with-plan → /code-review → /pr-create
-```
-
-実装完了後、`/code-review` でレビューし、`/pr-create` で PR を作成する。
+1. 上記の規則で計画ファイルのパスを決める
+2. `.claude/skills/implement-issue/SKILL.md` を読み、入力を `--plan <決めたパス>` として、その手順どおりに進める
+   - 中断した run があれば、同じ手順の「既存の checkpoint を確認する」で再開する

@@ -41,4 +41,4 @@ argument-hint: "[-- <pathspec>...]"
 
 ## 指摘の修正
 
-このコマンドは指摘を修正しない・コミットしない・PR にコメントしない。修正が必要な場合は、ユーザーの指示を受けて明示的な実装ステップ（`/start-with-plan` や個別の修正依頼）で行い、その後もう一度 `/code-review` を実行する。レビュー後に差分や検証証跡が変わると、`.claude/scripts/review status` は以前の結果を `STALE` と判定する。
+このコマンドは指摘を修正しない・コミットしない・PR にコメントしない。修正が必要な場合は、ユーザーの指示を受けて明示的な実装ステップ（`/implement-issue`・`/start-with-plan` や個別の修正依頼）で行い、その後もう一度 `/code-review` を実行する。レビュー後に差分や検証証跡が変わると、`.claude/scripts/review status` は以前の結果を `STALE` と判定する。

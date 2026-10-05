@@ -1,0 +1,605 @@
+#!/usr/bin/env bash
+# checkpoint — 1 Issue / 1 計画の実装フローの進行状態を、worktree ごとのローカル checkpoint に保存・照合する。
+# 仕様: scripts/checkpoint.md（配置後は .claude/scripts/checkpoint.md）
+# bash 3.2 互換を保つ（macOS 標準 bash で動かすため）。
+
+set -o pipefail
+
+SCHEMA="claude-run/v1"
+STAGES="spec implementing implemented verified reviewed published done"
+DEFAULT_MAX_ATTEMPTS=3
+
+usage() {
+  cat <<'EOF'
+usage: checkpoint <command> [args]
+
+commands:
+  start (--issue <n> --issue-file <path> | --plan <path>) [--remote <name>] [--repo <owner/name>]
+        [--base <ref>] [--max-attempts <n>]
+                             run を作り、run_id を表示する（作業 branch を用意してから実行）
+  resume [--issue-file <path>] 実際の作業ツリー・証跡と照合し、有効な段階まで戻して表示する
+  status                     resume と同じ照合をするが、checkpoint を書き換えない
+  criteria                   stdin の「<受入条件> :: <検証方法>」行で受入条件を置き換える
+  set <key=value>...         stage（spec / implementing / implemented）/ next / pr / max_attempts を更新する
+  record-verify              現在 VALID な verify 証跡を記録し stage=verified にする
+  record-review <review_id>  現在 VALID な review 結果を記録し stage=reviewed にする
+  record-push                upstream が HEAD と一致することを確認し stage=published にする
+  attempt                    修正サイクルの試行回数を 1 増やす（上限超過で BLOCKED）
+  block <reason> <next>      理由と次に必要な判断を記録して stage=blocked にする
+  done                       証跡が揃っていれば stage=done にする
+  abandon                    active な run を解除する（記録は残す）
+
+exit: 0=OK 1=照合失敗・条件不足 2=BLOCKED 3=active run の有無が合わない 64=使い方の誤り
+
+environment:
+  CLAUDE_RUN_STATE_DIR      保存先（既定: <git-dir>/claude-run）
+  CLAUDE_VERIFY_STATE_DIR   verify の証跡の場所（verify と同じ既定）
+EOF
+}
+
+die_usage() {
+  printf 'checkpoint: %s\n' "$1" >&2
+  exit 64
+}
+
+fail() {
+  printf 'checkpoint: %s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+one_line() { printf '%s' "$1" | LC_ALL=C tr '\000-\037' ' '; }
+
+hash_file() { git -C "$ROOT" hash-object --no-filters -- "$1" 2>/dev/null; }
+
+stage_rank() {
+  local i=0 s
+  for s in $STAGES; do
+    [ "$s" = "$1" ] && { printf '%s' "$i"; return 0; }
+    i=$((i + 1))
+  done
+  return 1
+}
+
+is_stage() { [ "$1" = "blocked" ] || stage_rank "$1" >/dev/null; }
+
+is_safe_relpath() {
+  case "$1" in
+    "" | /* | .. | ../* | */.. | */../*) return 1 ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------- setup
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || fail "git リポジトリ内で実行してください" 2
+ROOT=$(cd "$ROOT" && pwd -P)
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
+git_state_dir() {
+  local name="$1" env_value="$2" dir
+  if [ -n "$env_value" ]; then
+    dir="$env_value"
+  else
+    dir=$(git rev-parse --path-format=absolute --git-path "$name" 2>/dev/null) ||
+      dir="$(cd "$(git rev-parse --git-dir)" && pwd)/$name"
+  fi
+  case "$dir" in /*) ;; *) dir="$PWD/$dir" ;; esac
+  printf '%s' "$dir"
+}
+
+STATE_DIR=$(git_state_dir claude-run "${CLAUDE_RUN_STATE_DIR:-}")
+VERIFY_STATE_DIR=$(git_state_dir claude-verify "${CLAUDE_VERIFY_STATE_DIR:-}")
+GIT_DIR_ABS=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) ||
+  GIT_DIR_ABS=$(cd "$(git rev-parse --git-dir)" && pwd)
+
+# ---------------------------------------------------------------- state file
+
+RUN_ID=""
+RUN_DIR=""
+
+load_active() {
+  [ -f "$STATE_DIR/active" ] || return 1
+  RUN_ID=$(head -n 1 "$STATE_DIR/active")
+  RUN_DIR="$STATE_DIR/runs/$RUN_ID"
+  [ -n "$RUN_ID" ] && [ -f "$RUN_DIR/state" ]
+}
+
+require_active() {
+  load_active || fail "active な run がありません（checkpoint start で開始する）" 3
+}
+
+get() { sed -n "s/^$1=//p" "$RUN_DIR/state" | head -n 1; }
+
+# put key value [key value ...] — 1 回の書き込みでまとめて更新する
+put() {
+  local tmp="$RUN_DIR/state.tmp.$$" args="" k v
+  cp "$RUN_DIR/state" "$tmp" || fail "state を更新できません" 2
+  while [ $# -ge 2 ]; do
+    k="$1"
+    v=$(one_line "$2")
+    shift 2
+    grep -v "^$k=" "$tmp" >"$tmp.2"
+    printf '%s=%s\n' "$k" "$v" >>"$tmp.2"
+    mv "$tmp.2" "$tmp"
+    args="$args $k"
+  done
+  grep -v '^updated_at=' "$tmp" >"$tmp.2" && printf 'updated_at=%s\n' "$(now_utc)" >>"$tmp.2" && mv "$tmp.2" "$tmp"
+  mv "$tmp" "$RUN_DIR/state"
+}
+
+log_event() {
+  printf '%s\t%s\n' "$(now_utc)" "$(one_line "$1")" >>"$RUN_DIR/log"
+}
+
+set_stage() {
+  local stage="$1" note="$2"
+  put stage "$stage"
+  log_event "stage=$stage${note:+ ($note)}"
+}
+
+# ---------------------------------------------------------------- context
+
+current_branch() { git symbolic-ref --quiet --short HEAD 2>/dev/null || printf '(detached)'; }
+
+current_head() { git rev-parse --verify --quiet HEAD 2>/dev/null || printf 'unborn'; }
+
+remote_url() { git remote get-url "$1" 2>/dev/null; }
+
+dirty_paths() { git status --porcelain=v1 --untracked-files=all 2>/dev/null | cut -c4-; }
+
+verify_latest() { sed -n "s/^$1=//p" "$VERIFY_STATE_DIR/latest" 2>/dev/null | head -n 1; }
+
+verify_valid() {
+  local run="$1"
+  [ -n "$run" ] || return 1
+  [ -x "$SCRIPT_DIR/verify" ] || return 1
+  "$SCRIPT_DIR/verify" status >/dev/null 2>&1 || return 1
+  [ "$(verify_latest run_id)" = "$run" ]
+}
+
+review_valid() {
+  local id="$1"
+  [ -n "$id" ] || return 1
+  [ -x "$SCRIPT_DIR/review" ] || return 1
+  "$SCRIPT_DIR/review" status "$id" >/dev/null 2>&1
+}
+
+published_valid() {
+  local pushed="$1" upstream
+  [ -n "$pushed" ] || return 1
+  [ "$pushed" = "$(current_head)" ] || return 1
+  upstream=$(git rev-parse --verify --quiet '@{upstream}' 2>/dev/null) || return 1
+  [ "$upstream" = "$pushed" ]
+}
+
+# 照合結果（check_context / effective_stage が設定する）
+MISMATCHES=""
+NOTES=""
+EFFECTIVE=""
+RESUMED_FROM=""
+
+add_mismatch() { MISMATCHES="$MISMATCHES$1
+"; }
+add_note() { NOTES="$NOTES$1
+"; }
+
+# run を作った場所・対象と、現在の作業場所・対象が一致するか
+check_context() {
+  local issue_file="$1" target remote now_url
+  MISMATCHES=""
+  [ "$(get worktree)" = "$ROOT" ] || add_mismatch "worktree: 記録 $(get worktree) / 現在 $ROOT"
+  [ "$(get git_dir)" = "$GIT_DIR_ABS" ] || add_mismatch "git_dir: 記録 $(get git_dir) / 現在 $GIT_DIR_ABS"
+  [ "$(get branch)" = "$(current_branch)" ] || add_mismatch "branch: 記録 $(get branch) / 現在 $(current_branch)"
+  remote=$(get remote)
+  now_url=$(remote_url "$remote")
+  [ "$(get remote_url)" = "$now_url" ] || add_mismatch "remote $remote: 記録 $(get remote_url) / 現在 ${now_url:-(なし)}"
+
+  target=$(get target)
+  case "$target" in
+    issue:*)
+      if [ -n "$issue_file" ]; then
+        [ -f "$issue_file" ] || fail "issue file がありません: $issue_file" 64
+        [ "$(get issue_hash)" = "$(hash_file "$issue_file")" ] ||
+          add_mismatch "Issue 本文が run 開始時から変わっている（受入条件を確認し直す）"
+      else
+        add_note "Issue 本文は照合していない（--issue-file で最新の本文を渡す）"
+      fi
+      ;;
+    plan:*)
+      local plan="${target#plan:}"
+      if [ ! -f "$ROOT/$plan" ]; then
+        add_mismatch "計画ファイルがない: $plan"
+      elif [ "$(get plan_hash)" != "$(hash_file "$ROOT/$plan")" ]; then
+        # 計画ファイルは実装中に作業ツリーで編集されうるため、内容の変化として扱う
+        add_mismatch "計画ファイル $plan が run 開始時から変わっている（受入条件を確認し直す）"
+      fi
+      ;;
+  esac
+}
+
+# 記録された段階を、実際の証跡で裏付けられる段階まで下げる
+effective_stage() {
+  local stage rank
+  stage=$(get stage)
+  EFFECTIVE="$stage"
+  [ "$stage" = "blocked" ] && return 0
+  rank=$(stage_rank "$stage")
+
+  if [ "$rank" -ge "$(stage_rank published)" ] && ! published_valid "$(get pushed_oid)"; then
+    add_note "push 記録（$(get pushed_oid)）が現在の HEAD / upstream と一致しない → reviewed まで戻す"
+    EFFECTIVE="reviewed"
+    rank=$(stage_rank reviewed)
+  fi
+  if [ "$rank" -ge "$(stage_rank reviewed)" ] && ! review_valid "$(get review_id)"; then
+    add_note "review $(get review_id) は現在の入力に対して有効でない（STALE / 未記録）→ verified まで戻す"
+    EFFECTIVE="verified"
+    rank=$(stage_rank verified)
+  fi
+  if [ "$rank" -ge "$(stage_rank verified)" ] && ! verify_valid "$(get verify_run)"; then
+    add_note "verify run $(get verify_run) は現在のスナップショットに対して有効でない → implemented まで戻す（未検証の変更あり）"
+    EFFECTIVE="implemented"
+  fi
+  return 0
+}
+
+print_report() {
+  local label="$1" n
+  printf '%s run %s\n' "$label" "$RUN_ID"
+  printf 'target:   %s\n' "$(get target)"
+  printf 'repo:     %s (%s %s)\n' "$(get repo)" "$(get remote)" "$(get remote_url)"
+  printf 'worktree: %s\n' "$(get worktree)"
+  printf 'branch:   %s (base %s)\n' "$(get branch)" "$(get base)"
+  printf 'stage:    %s' "$EFFECTIVE"
+  if [ -n "$RESUMED_FROM" ]; then
+    printf '（記録の %s から戻した）' "$RESUMED_FROM"
+  elif [ "$EFFECTIVE" != "$(get stage)" ]; then
+    printf '（記録は %s）' "$(get stage)"
+  fi
+  printf '\n'
+  [ "$EFFECTIVE" = "blocked" ] && printf 'blocked:  %s\n' "$(get blocked_reason)"
+  printf 'next:     %s\n' "$(get next)"
+  printf 'attempts: %s / %s\n' "$(get attempts)" "$(get max_attempts)"
+  printf 'evidence: verify=%s review=%s pushed=%s pr=%s\n' \
+    "$(get verify_run)" "$(get review_id)" "$(get pushed_oid)" "$(get pr)"
+  if [ -s "$RUN_DIR/criteria" ]; then
+    printf 'criteria:\n'
+    sed 's/^/  - /' "$RUN_DIR/criteria"
+  else
+    printf 'criteria: (未記録)\n'
+  fi
+  n=$(dirty_paths | grep -c . || true)
+  printf 'worktree changes: %s paths（run 開始前からの変更は baseline に記録）\n' "$n"
+  [ -n "$MISMATCHES" ] && printf 'MISMATCH:\n%s' "$(printf '%s' "$MISMATCHES" | sed 's/^/  - /')" && printf '\n'
+  [ -n "$NOTES" ] && printf 'notes:\n%s' "$(printf '%s' "$NOTES" | sed 's/^/  - /')" && printf '\n'
+  return 0
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_start() {
+  local issue="" issue_file="" plan="" remote="origin" repo="" base="" max="$DEFAULT_MAX_ATTEMPTS"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --issue) [ $# -ge 2 ] || die_usage "--issue requires a number"; issue="$2"; shift 2 ;;
+      --issue-file) [ $# -ge 2 ] || die_usage "--issue-file requires a path"; issue_file="$2"; shift 2 ;;
+      --plan) [ $# -ge 2 ] || die_usage "--plan requires a path"; plan="$2"; shift 2 ;;
+      --remote) [ $# -ge 2 ] || die_usage "--remote requires a name"; remote="$2"; shift 2 ;;
+      --repo) [ $# -ge 2 ] || die_usage "--repo requires owner/name"; repo="$2"; shift 2 ;;
+      --base) [ $# -ge 2 ] || die_usage "--base requires a ref"; base="$2"; shift 2 ;;
+      --max-attempts) [ $# -ge 2 ] || die_usage "--max-attempts requires a number"; max="$2"; shift 2 ;;
+      *) die_usage "unknown argument: $1" ;;
+    esac
+  done
+  if [ -n "$issue" ] && [ -n "$plan" ]; then die_usage "--issue と --plan は同時に指定できません"; fi
+  if [ -z "$issue" ] && [ -z "$plan" ]; then die_usage "--issue か --plan を指定してください"; fi
+  case "$max" in "" | 0* | *[!0-9]*) die_usage "--max-attempts は正の整数" ;; esac
+
+  local target="" issue_hash="" plan_hash=""
+  if [ -n "$issue" ]; then
+    case "$issue" in "" | 0* | *[!0-9]*) die_usage "--issue は正の整数 1 件" ;; esac
+    [ -n "$issue_file" ] && [ -f "$issue_file" ] || die_usage "--issue には取得した本文の --issue-file が必要です"
+    target="issue:$issue"
+    issue_hash=$(hash_file "$issue_file")
+  else
+    is_safe_relpath "$plan" || die_usage "--plan はリポジトリルートからの相対パス"
+    [ -f "$ROOT/$plan" ] || fail "計画ファイルがありません: $plan" 1
+    target="plan:$plan"
+    plan_hash=$(hash_file "$ROOT/$plan")
+  fi
+
+  local url
+  url=$(remote_url "$remote") || fail "remote '$remote' がありません" 2
+
+  local branch
+  branch=$(current_branch)
+  [ "$branch" != "(detached)" ] || fail "detached HEAD では開始できません（作業 branch を用意する）" 2
+
+  if load_active; then
+    local s
+    s=$(get stage)
+    if [ "$s" != "done" ]; then
+      printf 'active run %s がある（target %s / stage %s）。resume で再開するか、abandon してから start する\n' \
+        "$RUN_ID" "$(get target)" "$s" >&2
+      exit 3
+    fi
+  fi
+
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  RUN_DIR="$STATE_DIR/runs/$RUN_ID"
+  mkdir -p "$RUN_DIR" || fail "保存先を作れません: $RUN_DIR" 2
+  {
+    printf 'schema=%s\n' "$SCHEMA"
+    printf 'run_id=%s\n' "$RUN_ID"
+    printf 'target=%s\n' "$target"
+    printf 'repo=%s\n' "$(one_line "$repo")"
+    printf 'remote=%s\n' "$remote"
+    printf 'remote_url=%s\n' "$url"
+    printf 'worktree=%s\n' "$ROOT"
+    printf 'git_dir=%s\n' "$GIT_DIR_ABS"
+    printf 'branch=%s\n' "$branch"
+    printf 'base=%s\n' "$(one_line "$base")"
+    printf 'start_head=%s\n' "$(current_head)"
+    printf 'issue_hash=%s\n' "$issue_hash"
+    printf 'plan_hash=%s\n' "$plan_hash"
+    printf 'stage=spec\n'
+    printf 'next=受入条件と検証方法を記録する（checkpoint criteria）\n'
+    printf 'attempts=0\n'
+    printf 'max_attempts=%s\n' "$max"
+    printf 'verify_run=\nreview_id=\npushed_oid=\npr=\nblocked_reason=\n'
+    printf 'created_at=%s\nupdated_at=%s\n' "$(now_utc)" "$(now_utc)"
+  } >"$RUN_DIR/state"
+  # run 開始前からある変更（利用者の無関係な差分の候補）。パスだけを残し、内容は保存しない
+  dirty_paths >"$RUN_DIR/baseline"
+  : >"$RUN_DIR/criteria"
+  log_event "start target=$target branch=$branch head=$(current_head)"
+  printf '%s\n' "$RUN_ID" >"$STATE_DIR/active.tmp.$$" && mv "$STATE_DIR/active.tmp.$$" "$STATE_DIR/active"
+
+  printf 'run_id=%s\n' "$RUN_ID"
+  printf 'state=%s\n' "$RUN_DIR/state"
+  if [ -s "$RUN_DIR/baseline" ]; then
+    printf 'baseline: run 開始前の変更 %s paths を記録した（この run のコミットに含めない）\n' \
+      "$(grep -c . "$RUN_DIR/baseline")"
+  fi
+}
+
+cmd_resume() {
+  local write="$1" issue_file=""
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --issue-file) [ $# -ge 2 ] || die_usage "--issue-file requires a path"; issue_file="$2"; shift 2 ;;
+      *) die_usage "unknown argument: $1" ;;
+    esac
+  done
+  require_active
+  NOTES=""
+  check_context "$issue_file"
+  if [ -n "$MISMATCHES" ]; then
+    EFFECTIVE=$(get stage)
+    print_report "MISMATCH"
+    printf '→ この checkpoint は現在の作業と一致しないため使わない。対象・branch を確認するか abandon して start し直す\n'
+    exit 1
+  fi
+  effective_stage
+  if [ "$write" = "1" ] && [ "$EFFECTIVE" != "$(get stage)" ]; then
+    local from
+    from=$(get stage)
+    case "$EFFECTIVE" in
+      implemented) put verify_run "" review_id "" pushed_oid "" ;;
+      verified) put review_id "" pushed_oid "" ;;
+      reviewed) put pushed_oid "" ;;
+    esac
+    put next "$(next_for "$EFFECTIVE")"
+    set_stage "$EFFECTIVE" "resume: $from から戻した"
+    RESUMED_FROM="$from"
+  fi
+  print_report "$([ "$write" = "1" ] && printf 'RESUME' || printf 'STATUS')"
+}
+
+next_for() {
+  case "$1" in
+    spec) printf '受入条件と検証方法を記録する（checkpoint criteria）' ;;
+    implementing) printf '残りの実装単位を進め、作業対象だけをコミットする' ;;
+    implemented) printf 'verify run → checkpoint record-verify' ;;
+    verified) printf 'review build → reviewer → review record → checkpoint record-review' ;;
+    reviewed) printf 'push → checkpoint record-push → PR 作成 / 更新' ;;
+    published) printf 'PR の状態を確認し、checkpoint done' ;;
+    done) printf 'なし' ;;
+    blocked) printf '%s' "$(get next)" ;;
+  esac
+}
+
+cmd_criteria() {
+  require_active
+  local tmp="$RUN_DIR/criteria.tmp.$$" line n=0 bad=0
+  : >"$tmp"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(one_line "$line")
+    case "$line" in "" | "#"*) continue ;; esac
+    case "$line" in
+      *" :: "*)
+        local cond="${line%% :: *}" method="${line#* :: }"
+        if [ -z "$cond" ] || [ -z "$method" ]; then bad=1; printf 'checkpoint: 条件または検証方法が空: %s\n' "$line" >&2; fi
+        ;;
+      *) bad=1; printf 'checkpoint: 「<受入条件> :: <検証方法>」の形式ではない: %s\n' "$line" >&2 ;;
+    esac
+    printf '%s\n' "$line" >>"$tmp"
+    n=$((n + 1))
+  done
+  [ "$bad" = 0 ] || { rm -f "$tmp"; exit 64; }
+  [ "$n" -gt 0 ] || { rm -f "$tmp"; fail "受入条件が 1 件もない" 64; }
+  mv "$tmp" "$RUN_DIR/criteria"
+  log_event "criteria=$n"
+  if [ "$(get stage)" = "spec" ]; then
+    put next "$(next_for implementing)"
+    set_stage implementing
+  fi
+  printf 'criteria: %s 件を記録した\n' "$n"
+}
+
+cmd_set() {
+  require_active
+  [ $# -gt 0 ] || die_usage "set <key=value>..."
+  local kv k v
+  for kv in "$@"; do
+    k="${kv%%=*}"
+    v="${kv#*=}"
+    [ "$k" != "$kv" ] || die_usage "key=value の形式で指定: $kv"
+    case "$k" in
+      stage)
+        is_stage "$v" || die_usage "不明な stage: $v"
+        case "$v" in
+          verified | reviewed | published | done) die_usage "stage=$v は record-verify / record-review / record-push / done で証跡を記録して進める" ;;
+          blocked) die_usage "blocked は checkpoint block <reason> <next> で記録する" ;;
+        esac
+        # 証跡付きの段階から戻すときは、その段階の証跡を外す
+        put verify_run "" review_id "" pushed_oid ""
+        set_stage "$v" "set"
+        ;;
+      next) put next "$v" ;;
+      max_attempts)
+        case "$v" in "" | 0* | *[!0-9]*) die_usage "max_attempts は正の整数" ;; esac
+        put max_attempts "$v"
+        log_event "max_attempts=$v"
+        ;;
+      pr)
+        case "$v" in "" | 0* | *[!0-9]*) die_usage "pr は正の整数" ;; esac
+        put pr "$v"
+        log_event "pr=$v"
+        ;;
+      *) die_usage "変更できない key: $k（target / repo / branch などは start で決まる）" ;;
+    esac
+  done
+}
+
+cmd_record_verify() {
+  require_active
+  NOTES=""
+  check_context ""
+  [ -z "$MISMATCHES" ] || { printf '%s' "$MISMATCHES" >&2; fail "checkpoint と現在の作業が一致しない" 1; }
+  local rank
+  rank=$(stage_rank "$(get stage)" 2>/dev/null) || fail "stage $(get stage) からは記録できない" 1
+  [ "$rank" -ge "$(stage_rank implementing)" ] || fail "受入条件が未記録（stage=spec）" 1
+  [ -x "$SCRIPT_DIR/verify" ] || fail "verify がありません: $SCRIPT_DIR/verify" 2
+  if ! "$SCRIPT_DIR/verify" status >/dev/null 2>&1; then
+    fail "verify の最新証跡が現在のスナップショットで VALID ではない（result=$(verify_latest result) reason=$(verify_latest reason)）" 1
+  fi
+  local run
+  run=$(verify_latest run_id)
+  put verify_run "$run" verify_fingerprint "$(verify_latest fingerprint)" verified_head "$(current_head)" \
+    review_id "" pushed_oid "" next "$(next_for verified)"
+  set_stage verified "verify run $run"
+  printf 'verified: verify run %s\n' "$run"
+}
+
+cmd_record_review() {
+  require_active
+  local id="$1"
+  [ -n "$id" ] || die_usage "record-review <review_id>"
+  NOTES=""
+  check_context ""
+  [ -z "$MISMATCHES" ] || { printf '%s' "$MISMATCHES" >&2; fail "checkpoint と現在の作業が一致しない" 1; }
+  [ "$(get stage)" = "verified" ] || [ "$(get stage)" = "reviewed" ] || fail "stage=$(get stage)。review は verified の後に記録する" 1
+  verify_valid "$(get verify_run)" || fail "記録した verify run が現在のスナップショットで有効でない。verify からやり直す" 1
+  [ -x "$SCRIPT_DIR/review" ] || fail "review がありません: $SCRIPT_DIR/review（#4 の reviewer が必要）" 2
+  review_valid "$id" || fail "review $id は現在の入力に対する PASS ではない（CHANGES_REQUESTED / BLOCKED / STALE）" 1
+  put review_id "$id" pushed_oid "" next "$(next_for reviewed)"
+  set_stage reviewed "review $id"
+  printf 'reviewed: review %s\n' "$id"
+}
+
+cmd_record_push() {
+  require_active
+  NOTES=""
+  check_context ""
+  [ -z "$MISMATCHES" ] || { printf '%s' "$MISMATCHES" >&2; fail "checkpoint と現在の作業が一致しない" 1; }
+  [ "$(get stage)" = "reviewed" ] || [ "$(get stage)" = "published" ] || fail "stage=$(get stage)。push は reviewed の後に記録する" 1
+  verify_valid "$(get verify_run)" || fail "verify が現在の HEAD で有効でない。最終コミット後に verify / review をやり直す" 1
+  review_valid "$(get review_id)" || fail "review が現在の入力で有効でない。review をやり直す" 1
+  local head upstream
+  head=$(current_head)
+  upstream=$(git rev-parse --verify --quiet '@{upstream}' 2>/dev/null) || fail "upstream が設定されていない（push -u 後に記録する）" 1
+  [ "$upstream" = "$head" ] || fail "upstream ($upstream) が HEAD ($head) と一致しない（fetch して確認する）" 1
+  put pushed_oid "$head" next "$(next_for published)"
+  set_stage published "pushed $head"
+  printf 'published: %s\n' "$head"
+}
+
+cmd_attempt() {
+  require_active
+  local n max
+  n=$(( $(get attempts) + 1 ))
+  max=$(get max_attempts)
+  put attempts "$n"
+  log_event "attempt=$n/$max"
+  if [ "$n" -gt "$max" ]; then
+    put blocked_reason "attempt_limit: 修正サイクルが上限 $max 回を超えた" \
+      next "残っている指摘と、方針変更・範囲縮小・上限変更のどれにするかを利用者が判断する"
+    set_stage blocked "attempt_limit"
+    printf 'BLOCKED attempt_limit (%s/%s)\n' "$n" "$max"
+    exit 2
+  fi
+  printf 'attempt %s/%s\n' "$n" "$max"
+}
+
+cmd_block() {
+  require_active
+  [ $# -eq 2 ] || die_usage "block <reason> <next>"
+  [ -n "$1" ] && [ -n "$2" ] || die_usage "reason と next は空にできない"
+  put blocked_reason "$1" next "$2"
+  set_stage blocked "$1"
+  printf 'BLOCKED %s\nnext: %s\n' "$1" "$2"
+}
+
+cmd_done() {
+  require_active
+  NOTES=""
+  check_context ""
+  [ -z "$MISMATCHES" ] || { printf '%s' "$MISMATCHES" >&2; fail "checkpoint と現在の作業が一致しない" 1; }
+  effective_stage
+  local missing=""
+  [ -s "$RUN_DIR/criteria" ] || missing="${missing}受入条件が未記録; "
+  verify_valid "$(get verify_run)" || missing="${missing}verify 未実行 / 失敗 / 古い; "
+  review_valid "$(get review_id)" || missing="${missing}review 未完了 / 古い; "
+  published_valid "$(get pushed_oid)" || missing="${missing}push 未記録 / HEAD と不一致; "
+  [ -n "$(get pr)" ] || missing="${missing}PR 未記録; "
+  if [ -n "$missing" ]; then
+    printf 'NOT DONE: %s\n' "$missing"
+    [ -n "$NOTES" ] && printf '%s' "$NOTES" | sed 's/^/  - /'
+    exit 1
+  fi
+  put next "なし"
+  set_stage "done"
+  printf 'done: run %s\n' "$RUN_ID"
+}
+
+cmd_abandon() {
+  require_active
+  log_event "abandon at stage=$(get stage)"
+  rm -f "$STATE_DIR/active"
+  printf 'abandoned: run %s（記録は %s に残る）\n' "$RUN_ID" "$RUN_DIR"
+}
+
+# ---------------------------------------------------------------- main
+
+[ $# -gt 0 ] || { usage; exit 64; }
+COMMAND="$1"
+shift
+case "$COMMAND" in
+  start) cmd_start "$@" ;;
+  resume) cmd_resume 1 "$@" ;;
+  status) cmd_resume 0 "$@" ;;
+  criteria) cmd_criteria "$@" ;;
+  set) cmd_set "$@" ;;
+  record-verify) cmd_record_verify "$@" ;;
+  record-review) cmd_record_review "$@" ;;
+  record-push) cmd_record_push "$@" ;;
+  attempt) cmd_attempt "$@" ;;
+  block) cmd_block "$@" ;;
+  done) cmd_done "$@" ;;
+  abandon) cmd_abandon "$@" ;;
+  -h | --help | help) usage ;;
+  *) die_usage "unknown command: $COMMAND" ;;
+esac
