@@ -1,0 +1,1180 @@
+#!/usr/bin/env bash
+# git-guard — Bash ツールで実行される git / gh を、実行前に現在の状態と照合する Hook。
+# 仕様: scripts/git-guard.md（配置後は .claude/scripts/git-guard.md）
+#
+#   git-guard pre    PreToolUse。stdin の Hook 入力を判定し、停止すべきときだけ deny / ask を返す
+#   git-guard post   PostToolUse。pre で記録した書き込み操作の実行後 OID を記録する
+#
+# 権限を広げることはしない（allow は返さない）。通常操作は settings.json の許可に委ねる。
+# bash 3.2 互換を保つ（macOS 標準 bash で動かすため）。
+
+set -o pipefail
+
+MODE="${1:-pre}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+emit() { # <ask|deny> <reason>
+  [ "$MODE" = pre ] || return 0
+  jq -n -c --arg d "$1" --arg r "git-guard: $2" \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: $d, permissionDecisionReason: $r}}'
+}
+
+INPUT=$(cat)
+
+if ! command -v jq >/dev/null 2>&1; then
+  # Hook 入力を解析できない。git / gh を含む可能性があれば確認へ倒す。
+  if [ "$MODE" = pre ] && printf '%s' "$INPUT" | grep -Eq '(^|[^A-Za-z0-9_-])(git|gh)([^A-Za-z0-9_-]|$)'; then
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"git-guard: jq が無いため git / gh の安全確認ができません"}}'
+  fi
+  exit 0
+fi
+
+CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
+HOOK_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
+[ -n "$HOOK_CWD" ] || HOOK_CWD="$PWD"
+[ -n "$CMD" ] || exit 0
+printf '%s' "$CMD" | grep -Eiq '(^|[^A-Za-z0-9_.-])(git|gh)([^A-Za-z0-9_-]|$)' || exit 0
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$HOOK_CWD}"
+PROJECT_TOP=$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null)
+STATE_DIR=""
+if [ -n "$PROJECT_TOP" ]; then
+  STATE_DIR="$(git -C "$PROJECT_TOP" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/claude-guard"
+fi
+CMD_KEY=$(printf '%s' "$CMD" | git hash-object --stdin 2>/dev/null)
+
+# ---------------------------------------------------------------- 記録
+
+log_event() { # <phase> <decision> <rule> <reason> [oids_after]
+  [ -n "$STATE_DIR" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  # コマンド本文は記録しない（引数に秘密が含まれうるため）。操作名・対象 ref・OID だけを残す。
+  jq -n -c \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg phase "$1" --arg decision "$2" \
+    --arg rule "$3" --arg reason "$4" --arg op "$LOG_OP" --arg repo "$REPO_TOP" \
+    --arg branch "$CUR_BRANCH" --arg head "$HEAD_OID" --arg refs "$LOG_REFS" \
+    --arg oids "$LOG_OIDS" --arg after "${5:-}" --arg key "$CMD_KEY" \
+    '{ts:$ts, phase:$phase, decision:$decision, rule:$rule, reason:$reason, op:$op, repo:$repo,
+      branch:$branch, head:$head, refs:$refs, oids:$oids, after:$after, command_key:$key}' \
+    >>"$STATE_DIR/log.jsonl" 2>/dev/null
+}
+
+record_pending() {
+  [ -n "$STATE_DIR" ] && [ -n "$CMD_KEY" ] || return 0
+  mkdir -p "$STATE_DIR/pending" 2>/dev/null || return 0
+  printf '%s\t%s\t%s\t%s\n' "$LOG_OP" "$GDIR" "$LOG_REFS" "$PUSH_REMOTE" >>"$STATE_DIR/pending/$CMD_KEY"
+}
+
+if [ "$MODE" = post ]; then
+  PENDING="$STATE_DIR/pending/$CMD_KEY"
+  [ -n "$STATE_DIR" ] && [ -f "$PENDING" ] || exit 0
+  while IFS="$(printf '\t')" read -r LOG_OP GDIR LOG_REFS PUSH_REMOTE; do
+    REPO_TOP=$(git -C "$GDIR" rev-parse --show-toplevel 2>/dev/null)
+    CUR_BRANCH=$(git -C "$GDIR" symbolic-ref -q --short HEAD 2>/dev/null)
+    HEAD_OID=$(git -C "$GDIR" rev-parse -q --verify HEAD 2>/dev/null)
+    LOG_OIDS=""
+    after=""
+    for r in $LOG_REFS; do
+      case "$r" in
+        PR#* | *'->'*) ;;
+        *) after="$after${after:+ }$r=$(git -C "$GDIR" rev-parse -q --verify "refs/remotes/${PUSH_REMOTE:-origin}/$r" 2>/dev/null || git -C "$GDIR" rev-parse -q --verify "$r" 2>/dev/null)" ;;
+      esac
+    done
+    log_event post "done" "" "" "HEAD=$HEAD_OID${after:+ $after}"
+  done <"$PENDING"
+  rm -f "$PENDING"
+  exit 0
+fi
+
+# 権限確認で実行されなかった前回分を残さない
+[ -n "$STATE_DIR" ] && [ -n "$CMD_KEY" ] && rm -f "$STATE_DIR/pending/$CMD_KEY"
+
+# ---------------------------------------------------------------- 字句解析
+# シェルの完全な構文解析ではない。引用符・エスケープ・コマンド置換・heredoc・連結/パイプ・
+# リダイレクトを区切り、単語列（T<動的か><単語>）とセグメント終端（E）を出力する。
+# heredoc 本文は B 行、閉じていない引用符などは X 行で示す。
+
+read -r -d '' TOKENIZER <<'AWK'
+BEGIN { RS = "\001"; ORS = "" }
+{ src = src $0 }
+END {
+  n = length(src); pos = 1; out = ""
+  scan(0)
+  if (unterminated) out = out "X\n"
+  print out
+}
+function endword(   w) {
+  if (inw) {
+    if (redir) redir = 0
+    else { w = word; gsub(/[\n\t\r]/, " ", w); seg = seg "T" (dyn ? 1 : 0) w "\n" }
+  }
+  word = ""; inw = 0; dyn = 0
+}
+function endseg() { endword(); if (seg != "") out = out seg "E\n"; seg = ""; redir = 0 }
+function heredoc_bodies(   cnt, parts, i, strip, d, body, nl, line) {
+  cnt = split(pend, parts, "\034")
+  for (i = 1; i <= cnt; i++) {
+    if (parts[i] == "") continue
+    strip = (substr(parts[i], 1, 1) == "-"); d = substr(parts[i], 2); body = ""
+    while (pos <= n) {
+      nl = index(substr(src, pos), "\n")
+      if (nl == 0) { line = substr(src, pos); pos = n + 1 } else { line = substr(src, pos, nl - 1); pos += nl }
+      if (strip) sub(/^\t+/, "", line)
+      if (line == d) break
+      body = body " " line
+    }
+    gsub(/[\t\r]/, " ", body)
+    seg = seg "B" body "\n"
+  }
+  pend = ""
+}
+function subscan(   s_seg, s_word, s_inw, s_dyn, s_redir, s_pend) {
+  s_seg = seg; s_word = word; s_inw = inw; s_dyn = dyn; s_redir = redir; s_pend = pend
+  seg = ""; word = ""; inw = 0; dyn = 0; redir = 0; pend = ""
+  scan(1)
+  seg = s_seg; word = s_word; inw = s_inw; dyn = s_dyn; redir = s_redir; pend = s_pend
+}
+function backtick(   q, content, s_src, s_n, s_pos) {
+  q = index(substr(src, pos + 1), "`")
+  if (q == 0) { unterminated = 1; pos = n + 1; return }
+  content = substr(src, pos + 1, q - 1); s_pos = pos + q + 1
+  s_src = src; s_n = n
+  src = content; n = length(content); pos = 1
+  subscan()
+  src = s_src; n = s_n; pos = s_pos
+  dyn = 1; inw = 1; word = word "`...`"
+}
+function dollar(   c2, q) {
+  c2 = substr(src, pos + 1, 1)
+  if (c2 == "(") {
+    if (substr(src, pos + 2, 1) == "(") {
+      q = index(substr(src, pos + 3), "))")
+      pos = (q == 0) ? n + 1 : pos + q + 4
+      dyn = 1; inw = 1; word = word "$((...))"; return
+    }
+    pos += 2; dyn = 1; inw = 1; word = word "$(...)"
+    subscan(); return
+  }
+  if (c2 ~ /[A-Za-z_{0-9@*#?!$-]/) { dyn = 1; inw = 1; word = word "$"; pos++; return }
+  if (c2 == "\047") { pos++; return }
+  word = word "$"; inw = 1; pos++
+}
+function dquote(   c, c2) {
+  while (pos <= n) {
+    c = substr(src, pos, 1)
+    if (c == "\"") { pos++; return }
+    if (c == "\\") {
+      c2 = substr(src, pos + 1, 1)
+      if (c2 == "\n") { pos += 2; continue }
+      if (c2 == "\"" || c2 == "\\" || c2 == "$" || c2 == "`") { word = word c2; pos += 2; continue }
+      word = word c; pos++; continue
+    }
+    if (c == "$") { dollar(); continue }
+    if (c == "`") { backtick(); continue }
+    word = word c; pos++
+  }
+  unterminated = 1
+}
+function redirection(   strip, d, c) {
+  if (inw && word ~ /^[0-9]+$/) { word = ""; inw = 0; dyn = 0 } else endword()
+  if (substr(src, pos, 3) == "<<<") { pos += 3; redir = 1; return }
+  if (substr(src, pos, 2) == "<<") {
+    pos += 2; strip = 0
+    if (substr(src, pos, 1) == "-") { strip = 1; pos++ }
+    while (substr(src, pos, 1) == " " || substr(src, pos, 1) == "\t") pos++
+    d = ""
+    while (pos <= n) {
+      c = substr(src, pos, 1)
+      if (c ~ /[ \t\n;|&<>()]/) break
+      if (c != "\047" && c != "\"" && c != "\\") d = d c
+      pos++
+    }
+    pend = pend "\034" (strip ? "-" : "=") d
+    return
+  }
+  pos++
+  while (substr(src, pos, 1) ~ /[<>&|]/ && pos <= n) pos++
+  redir = 1
+}
+function scan(depth,   c, c2, plevel, q) {
+  plevel = 0
+  while (pos <= n) {
+    c = substr(src, pos, 1)
+    if (c == "\\") {
+      c2 = substr(src, pos + 1, 1)
+      if (c2 == "\n") { pos += 2; continue }
+      word = word c2; inw = 1; pos += 2; continue
+    }
+    if (c == "\047") {
+      q = index(substr(src, pos + 1), "\047")
+      if (q == 0) { unterminated = 1; word = word substr(src, pos + 1); inw = 1; pos = n + 1; break }
+      word = word substr(src, pos + 1, q - 1); inw = 1; pos += q + 1; continue
+    }
+    if (c == "\"") { pos++; inw = 1; dquote(); continue }
+    if (c == "$") { dollar(); continue }
+    if (c == "`") { backtick(); continue }
+    if (c == " " || c == "\t") { endword(); pos++; continue }
+    if (c == "\n") { endword(); pos++; if (pend != "") heredoc_bodies(); endseg(); continue }
+    if (c == "&" && substr(src, pos + 1, 1) == ">") { endword(); pos++; redirection(); continue }
+    if (c == ";" || c == "&" || c == "|") { endseg(); pos++; continue }
+    if (c == "(" && !inw) { endseg(); plevel++; pos++; continue }
+    if (c == ")") {
+      if (plevel > 0) { plevel--; endseg(); pos++; continue }
+      endseg(); pos++
+      if (depth > 0) return
+      continue
+    }
+    if (c == "<" || c == ">") { redirection(); continue }
+    if (c == "#" && !inw) {
+      q = index(substr(src, pos), "\n")
+      pos = (q == 0) ? n + 1 : pos + q - 1
+      continue
+    }
+    word = word c; inw = 1; pos++
+  }
+  endseg()
+}
+AWK
+
+TOKENS=$(printf '%s' "$CMD" | awk "$TOKENIZER" 2>/dev/null) || TOKENS="X"
+
+# ---------------------------------------------------------------- 判定の集約
+
+DECISION=pass
+REASONS=""
+EFF_DIR="$HOOK_CWD"
+DIR_UNKNOWN=0
+STATE_SHIFTED=""   # 同じコマンド内で先に HEAD / ブランチを動かした git サブコマンド
+
+verdict() { # <pass|ask|deny> <rule> <reason>
+  local lv="$1" rule="$2" reason="$3"
+  if [ -n "$STATE_SHIFTED" ]; then
+    lv=deny; rule="state-shifted"; reason="前段の git ${STATE_SHIFTED} で HEAD / ブランチが変わるため、続く操作を事前に確認できません。コマンドを分けて実行してください"
+  fi
+  if [ "$lv" = pass ]; then
+    if [ "$DIR_UNKNOWN" = 1 ]; then lv=ask; rule="dynamic-dir"; reason="作業ディレクトリが動的に変わるため、対象リポジトリを確認できません"
+    elif [ "$OUT_OF_PROJECT" = 1 ]; then lv=ask; rule="out-of-project"; reason="プロジェクト外のリポジトリ（${OUT_TARGET}）への書き込みです"
+    elif [ "$ALT_GITDIR" = 1 ]; then lv=ask; rule="alt-gitdir"; reason="--git-dir / --work-tree 指定のため対象を確認できません"
+    elif [ -n "$RISKY_CFG" ]; then lv=ask; rule="inline-config"; reason="-c $RISKY_CFG は保護や認証の挙動を変えうるため確認が必要です"
+    fi
+  fi
+  case "$lv" in
+    deny) DECISION=deny ;;
+    ask) [ "$DECISION" = deny ] || DECISION=ask ;;
+  esac
+  [ "$lv" = pass ] || REASONS="${REASONS:+$REASONS / }$reason"
+  log_event pre "$lv" "$rule" "$reason"
+  [ "$lv" = deny ] || record_pending
+}
+
+g() { git -C "$GDIR" "$@"; }
+
+short() { printf '%s' "$1" | cut -c1-12; }
+
+protected_list() {
+  local h
+  h=$(g symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
+  printf '%s %s\n' "${CLAUDE_GIT_GUARD_PROTECTED:-main master develop}" "${h#origin/}"
+}
+
+is_protected() {
+  local b
+  for b in $(protected_list); do [ "$b" = "$1" ] && return 0; done
+  return 1
+}
+
+integration_base() {
+  if g show-ref -q --verify refs/remotes/origin/develop || g show-ref -q --verify refs/heads/develop; then
+    echo develop
+    return
+  fi
+  local h
+  h=$(g symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
+  [ -n "$h" ] && echo "${h#origin/}" || echo main
+}
+
+# 変更内容（コミット済みでないもの）を持つ追跡ファイル
+dirty_tracked() {
+  if g rev-parse -q --verify HEAD >/dev/null; then
+    g diff HEAD --name-only 2>/dev/null
+  else
+    g diff --cached --name-only 2>/dev/null
+  fi
+}
+
+list_head() { # 先頭 5 件を 1 行で
+  printf '%s\n' "$1" | sed '/^$/d' | head -5 | tr '\n' ' ' | sed 's/ $//'
+}
+
+# <ref> に含まれ、他のどのブランチ・リモート・タグ・退避 ref からも到達できない commit
+# 第 2 引数で除外するローカルブランチ名（移動・削除される本人）を指定する
+orphaned_commits() { # <rev> <exclude-branch> [extra-not-rev]
+  g rev-list "$1" --not ${3:+"$3"} --exclude="$2" --branches --remotes --tags --glob='refs/claude-backup/*' 2>/dev/null
+}
+
+has_dynamic() { # ARGS のうち動的な単語があるか
+  local i
+  for ((i = ARG_START; i < ${#WORDS[@]}; i++)); do
+    [ "${DYNS[$i]}" = 1 ] && return 0
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- git
+
+git_push() {
+  local remote="" force=0 bare_lease=0 delete=0 dry=0 noverify=0 broad="" a i
+  local -a refspecs=() leases=()
+  for ((i = ARG_START; i < ${#WORDS[@]}; i++)); do
+    a="${WORDS[$i]}"
+    case "$a" in
+      --force) force=1 ;;
+      --force-with-lease) bare_lease=1 ;;
+      --force-with-lease=*) leases+=("${a#--force-with-lease=}") ;;
+      --force-if-includes | --no-force-if-includes) ;;
+      --delete) delete=1 ;;
+      --dry-run) dry=1 ;;
+      --no-verify) noverify=1 ;;
+      --mirror | --all | --branches | --prune) broad="$a" ;;
+      --repo=* | --receive-pack* | --exec*) broad="$a" ;;
+      -o | --push-option) i=$((i + 1)) ;;
+      --) ;;
+      --*) ;;
+      -*)
+        case "$a" in *f*) force=1 ;; esac
+        case "$a" in *d*) delete=1 ;; esac
+        case "$a" in *n*) dry=1 ;; esac
+        case "$a" in *o) i=$((i + 1)) ;; esac
+        ;;
+      *)
+        if [ -z "$remote" ]; then remote="$a"; else refspecs+=("$a"); fi
+        ;;
+    esac
+  done
+  LOG_OP="git push"
+  [ "$dry" = 1 ] && return
+  if has_dynamic; then verdict ask push-dynamic "push の引数が動的で、対象 ref を確認できません"; return; fi
+  if [ -n "$broad" ]; then verdict ask push-broad "push $broad は複数の ref を書き換えうるため確認が必要です"; return; fi
+  if [ "$noverify" = 1 ]; then verdict ask push-no-verify "--no-verify は pre-push の保護を迂回します"; return; fi
+
+  [ -n "$remote" ] || remote=$(g config "branch.$CUR_BRANCH.remote" 2>/dev/null)
+  [ -n "$remote" ] || remote=origin
+  PUSH_REMOTE="$remote"
+
+  if [ ${#refspecs[@]} -eq 0 ]; then
+    if [ -z "$CUR_BRANCH" ]; then verdict ask push-detached "detached HEAD からの push は対象 ref を確認できません"; return; fi
+    local up
+    up=$(g config "branch.$CUR_BRANCH.merge" 2>/dev/null)
+    up="${up#refs/heads/}"
+    refspecs=("$CUR_BRANCH:${up:-$CUR_BRANCH}")
+  fi
+
+  local spec plus src dst lvl=pass rule=push reason="" oids=""
+  for spec in "${refspecs[@]}"; do
+    plus=0
+    case "$spec" in +*) plus=1; spec="${spec#+}" ;; esac
+    case "$spec" in
+      *:*) src="${spec%%:*}"; dst="${spec#*:}" ;;
+      *) src="$spec"; dst="$spec" ;;
+    esac
+    [ "$delete" = 1 ] && { dst="${dst:-$src}"; src=""; }
+    [ "$src" = HEAD ] && [ "$dst" = HEAD ] && dst="$CUR_BRANCH"
+    dst="${dst#refs/heads/}"
+    LOG_REFS="${LOG_REFS:+$LOG_REFS }$dst"
+
+    case "$dst" in
+      refs/tags/* | refs/*)
+        if [ -z "$src" ] || [ "$force" = 1 ] || [ "$plus" = 1 ]; then
+          verdict ask push-ref "$dst の削除・強制更新は通常の作業 branch 操作の範囲外です"; return
+        fi
+        continue
+        ;;
+    esac
+
+    # 削除
+    if [ -z "$src" ]; then
+      if is_protected "$dst"; then verdict deny push-delete-protected "統合ブランチ $dst のリモート削除は行いません"; return; fi
+      local tip base
+      tip=$(g rev-parse -q --verify "refs/remotes/$remote/$dst")
+      base=$(integration_base)
+      if [ -z "$tip" ]; then verdict ask push-delete-unknown "リモートの $dst を確認できないため削除できません（fetch して確認）"; return; fi
+      if ! g merge-base --is-ancestor "$tip" "refs/remotes/$remote/$base" 2>/dev/null; then
+        verdict ask push-delete-unmerged "リモートの ${dst}（$(short "$tip")）は $remote/$base に未統合です"; return
+      fi
+      oids="$oids $dst:$(short "$tip")"
+      continue
+    fi
+
+    if [ "$force" = 1 ] || [ "$plus" = 1 ]; then
+      verdict deny push-force "無条件の force push は使いません。git push --force-with-lease=$dst:<確認したリモートの OID> を使ってください"; return
+    fi
+
+    local src_oid
+    src_oid=$(g rev-parse -q --verify "$src^{commit}" 2>/dev/null)
+    if [ -z "$src_oid" ]; then verdict ask push-src-unknown "push 元 $src を解決できません"; return; fi
+
+    local lease="" l lref
+    for l in ${leases[@]+"${leases[@]}"}; do
+      lref="${l%%:*}"; lref="${lref#refs/heads/}"
+      [ "$lref" = "$dst" ] && lease="$l"
+    done
+    if [ -z "$lease" ] && [ "$bare_lease" = 1 ]; then
+      verdict deny push-lease-implicit "期待 OID を省略した --force-with-lease は使いません。--force-with-lease=$dst:<確認したリモートの OID> を指定してください"; return
+    fi
+    if [ -z "$lease" ] && [ ${#leases[@]} -gt 0 ]; then
+      verdict deny push-lease-mismatch "--force-with-lease の対象が push 先 $dst と一致しません"; return
+    fi
+
+    if is_protected "$dst"; then
+      if [ -n "$lease" ]; then verdict deny push-force-protected "統合ブランチ $dst の履歴は書き換えません"; return; fi
+      lvl=ask; rule=push-protected; reason="統合ブランチ $dst への直接 push です。PR 経由で統合してください"
+      continue
+    fi
+
+    if [ -n "$lease" ]; then
+      case "$lease" in
+        *:*) ;;
+        *) verdict deny push-lease-implicit "期待 OID を省略した --force-with-lease は使いません。--force-with-lease=$dst:<確認したリモートの OID> を指定してください"; return ;;
+      esac
+      local expect exp_oid remote_now lost
+      expect="${lease#*:}"
+      if [ -n "$expect" ]; then
+        exp_oid=$(g rev-parse -q --verify "$expect^{commit}" 2>/dev/null)
+        if [ -z "$exp_oid" ]; then
+          verdict deny push-lease-unknown "期待 OID $expect がローカルにありません。fetch してリモートの履歴を確認してください"; return
+        fi
+      fi
+      if ! remote_now=$(g ls-remote --heads "$remote" "refs/heads/$dst" 2>/dev/null); then
+        verdict ask push-remote-unreachable "$remote の現在の $dst を取得できません"; return
+      fi
+      remote_now=$(printf '%s\n' "$remote_now" | awk 'NR==1 {print $1}')
+      if [ "$remote_now" != "$exp_oid" ]; then
+        verdict deny push-remote-moved "$remote/$dst が確認時点（$(short "${exp_oid:-なし}")）から $(short "${remote_now:-なし}") に更新されています。上書きや新しい先端での再試行はせず、停止して差分を利用者に報告してください"; return
+      fi
+      if [ -n "$exp_oid" ]; then
+        lost=$(g cherry "$src_oid" "$exp_oid" 2>/dev/null | awk '$1 == "+" {print substr($2, 1, 12)}')
+        if [ -n "$lost" ]; then
+          verdict ask push-drops-commits "書き換え後の $dst に含まれない commit があります: $(list_head "$lost")"; return
+        fi
+      fi
+      rule=push-lease
+      oids="$oids $dst:$(short "${exp_oid:-none}")->$(short "$src_oid")"
+    fi
+  done
+  LOG_OIDS="${oids# }"
+  verdict "$lvl" "$rule" "$reason"
+}
+
+git_reset() {
+  local hard=0 a i target="" paths=0
+  for ((i = ARG_START; i < ${#WORDS[@]}; i++)); do
+    a="${WORDS[$i]}"
+    case "$a" in
+      --hard) hard=1 ;;
+      --) paths=1; break ;;
+      -*) ;;
+      *) [ -z "$target" ] && target="$a" || paths=1 ;;
+    esac
+  done
+  LOG_OP="git reset"
+  if [ "$paths" = 1 ] || { [ -n "$target" ] && ! g rev-parse -q --verify "$target^{commit}" >/dev/null 2>&1; }; then
+    [ "$hard" = 1 ] || return   # パス指定の reset は index の操作のみ
+  fi
+  if has_dynamic; then verdict ask reset-dynamic "reset の引数が動的で、移動先を確認できません"; return; fi
+  if [ "$hard" = 1 ]; then
+    local d
+    d=$(dirty_tracked)
+    if [ -n "$d" ]; then verdict deny reset-hard-dirty "未コミットの変更が失われます: $(list_head "$d")"; return; fi
+  fi
+  [ -n "$target" ] || target=HEAD
+  local lost
+  lost=$(orphaned_commits HEAD "$CUR_BRANCH" "$target")
+  if [ -n "$lost" ]; then
+    verdict ask reset-orphans "$(printf '%s\n' "$lost" | wc -l | tr -d ' ') 個の commit がどの ref からも辿れなくなります。先に refs/claude-backup/ に退避してください"; return
+  fi
+  LOG_REFS="$CUR_BRANCH"; LOG_OIDS="$(short "$HEAD_OID")->$(short "$(g rev-parse -q --verify "$target")")"
+  verdict pass reset ""
+}
+
+check_paths_overwrite() { # <rule> <from-commit:0|1> <pathspec...>
+  local rule="$1" from_commit="$2" d
+  shift 2
+  if [ "$from_commit" = 1 ]; then
+    d=$(g diff HEAD --name-only -- "$@" 2>/dev/null)
+  else
+    d=$(g diff --name-only -- "$@" 2>/dev/null)
+  fi
+  if [ -n "$d" ]; then verdict ask "$rule" "未コミットの変更を上書きします: $(list_head "$d")"; return; fi
+  verdict pass "$rule" ""
+}
+
+check_branch_reset() { # <branch> <start>
+  local tip lost
+  tip=$(g rev-parse -q --verify "refs/heads/$1") || return 0
+  lost=$(orphaned_commits "$tip" "$1" "${2:-HEAD}")
+  if [ -n "$lost" ]; then
+    verdict ask branch-reset "ブランチ $1 を付け替えると $(printf '%s\n' "$lost" | wc -l | tr -d ' ') 個の commit が辿れなくなります"; return 1
+  fi
+  return 0
+}
+
+git_checkout() { # checkout / switch
+  local sub="$1" force=0 newb="" resetb="" sep=-1 a i
+  local -a pos=()
+  for ((i = ARG_START; i < ${#WORDS[@]}; i++)); do
+    a="${WORDS[$i]}"
+    if [ "$sep" -ge 0 ]; then pos+=("$a"); continue; fi
+    case "$a" in
+      --) sep=${#pos[@]} ;;
+      -f | --force | --discard-changes) force=1 ;;
+      -b | -c | --create | --orphan) newb="${WORDS[$((i + 1))]}"; i=$((i + 1)) ;;
+      -B | -C | --force-create) resetb="${WORDS[$((i + 1))]}"; i=$((i + 1)) ;;
+      -*) ;;
+      *) pos+=("$a") ;;
+    esac
+  done
+  LOG_OP="git $sub"
+  if has_dynamic; then verdict ask checkout-dynamic "$sub の引数が動的で、上書き対象を確認できません"; return; fi
+
+  if [ -n "$resetb" ]; then
+    check_branch_reset "$resetb" "${pos[0]}" || return
+  fi
+
+  # パス指定の checkout（ファイルの内容を戻す）
+  if [ "$sub" = checkout ]; then
+    if [ "$sep" -ge 0 ]; then
+      local -a paths=("${pos[@]:$sep}")
+      if [ ${#paths[@]} -gt 0 ]; then
+        check_paths_overwrite checkout-paths "$([ "$sep" -gt 0 ] && echo 1 || echo 0)" "${paths[@]}"; return
+      fi
+    elif [ ${#pos[@]} -gt 0 ] && [ -z "$newb$resetb" ]; then
+      if ! g rev-parse -q --verify "${pos[0]}^{commit}" >/dev/null 2>&1 &&
+        ! g show-ref -q --verify "refs/remotes/origin/${pos[0]}"; then
+        check_paths_overwrite checkout-paths 0 "${pos[@]}"; return
+      elif [ ${#pos[@]} -gt 1 ]; then
+        check_paths_overwrite checkout-paths 1 "${pos[@]:1}"; return
+      fi
+    fi
+  fi
+
+  if [ "$force" = 1 ]; then
+    local d
+    d=$(dirty_tracked)
+    if [ -n "$d" ]; then verdict ask checkout-force "未コミットの変更を破棄します: $(list_head "$d")"; return; fi
+  fi
+  [ -n "$newb$resetb" ] && LOG_REFS="$newb$resetb"
+  verdict pass "$sub" ""
+}
+
+git_restore() {
+  local staged=0 worktree=0 source=0 a i
+  local -a paths=()
+  for ((i = ARG_START; i < ${#WORDS[@]}; i++)); do
+    a="${WORDS[$i]}"
+    case "$a" in
+      -S | --staged) staged=1 ;;
+      -W | --worktree) worktree=1 ;;
+      -s | --source) source=1; i=$((i + 1)) ;;
+      --source=*) source=1 ;;
+      --) ;;
+      -*) ;;
+      *) paths+=("$a") ;;
+    esac
+  done
+  LOG_OP="git restore"
+  if [ "$staged" = 1 ] && [ "$worktree" = 0 ]; then return; fi
+  if has_dynamic; then verdict ask restore-dynamic "restore の引数が動的で、上書き対象を確認できません"; return; fi
+  [ ${#paths[@]} -gt 0 ] || paths=(.)
+  check_paths_overwrite restore "$([ "$source" = 1 ] || [ "$staged" = 1 ] && echo 1 || echo 0)" "${paths[@]}"
+}
+
+git_clean() {
+  local a i
+  local -a sim=()
+  for ((i = ARG_START; i < ${#WORDS[@]}; i++)); do
+    a="${WORDS[$i]}"
+    case "$a" in
+      -n | --dry-run) return ;;
+      -i | --interactive) verdict ask clean-interactive "対話モードの clean は扱いません"; return ;;
+      --force) ;;
+      --*) sim+=("$a") ;;
+      -*)
+        case "$a" in *n*) return ;; esac
+        a=$(printf '%s' "$a" | tr -d 'f')
+        [ "$a" = "-" ] || sim+=("$a")
+        ;;
+      *) sim+=("$a") ;;
+    esac
+  done
+  LOG_OP="git clean"
+  if has_dynamic; then verdict ask clean-dynamic "clean の引数が動的です"; return; fi
+  local out
+  out=$(g clean -n ${sim[@]+"${sim[@]}"} 2>/dev/null | sed 's/^Would remove //')
+  if [ -n "$out" ]; then
+    verdict ask clean-untracked "未追跡ファイルを削除します: $(list_head "$out")"; return
+  fi
+  verdict pass clean ""
+}
+
+git_branch() {
+  local del=0 force=0 move=0 a i
+  local -a names=()
+  for ((i = ARG_START; i < ${#WORDS[@]}; i++)); do
+    a="${WORDS[$i]}"
+    case "$a" in
+      -d | --delete) del=1 ;;
+      -D) del=1; force=1 ;;
+      -f | --force) force=1 ;;
+      -m | --move | -c | --copy) move=1 ;;
+      -M | -C) move=1; force=1 ;;
+      -u | --set-upstream-to | -t | --track) ;;
+      --set-upstream-to=* | --track=*) ;;
+      --list | -l | -a | -r | -v | -vv | --contains | --merged | --no-merged | --show-current | --format* | --sort*) return ;;
+      -*) ;;
+      *) names+=("$a") ;;
+    esac
+  done
+  if [ "$del" = 0 ] && [ "$force" = 0 ] && [ "$move" = 0 ]; then
+    # 作成のみ（または一覧）
+    [ ${#names[@]} -gt 0 ] || return
+    LOG_OP="git branch"; LOG_REFS="${names[0]}"
+    verdict pass branch-create ""; return
+  fi
+  LOG_OP="git branch"
+  if has_dynamic; then verdict ask branch-dynamic "branch の引数が動的です"; return; fi
+  local b lost
+  if [ "$del" = 1 ]; then
+    for b in ${names[@]+"${names[@]}"}; do
+      LOG_REFS="${LOG_REFS:+$LOG_REFS }$b"
+      if is_protected "$b"; then verdict deny branch-delete-protected "統合ブランチ $b は削除しません"; return; fi
+      if [ "$force" = 1 ]; then
+        lost=$(orphaned_commits "refs/heads/$b" "$b")
+        if [ -n "$lost" ]; then
+          verdict ask branch-delete-unmerged "$b にだけ存在する commit があります: $(list_head "$(printf '%s\n' "$lost" | cut -c1-12)")"; return
+        fi
+      fi
+    done
+    verdict pass branch-delete ""; return
+  fi
+  # -f / -M / -C: 既存ブランチの付け替え
+  if [ "$move" = 1 ]; then
+    b="${names[${#names[@]} - 1]}"
+    check_branch_reset "$b" "${names[0]}" || return
+  else
+    check_branch_reset "${names[0]}" "${names[1]:-HEAD}" || return
+  fi
+  LOG_REFS="${names[*]}"
+  verdict pass branch-force ""
+}
+
+git_rebase() {
+  local a i
+  for ((i = ARG_START; i < ${#WORDS[@]}; i++)); do
+    a="${WORDS[$i]}"
+    case "$a" in
+      --continue | --abort | --quit | --skip | --show-current-patch | --edit-todo) return ;;
+      -i | --interactive) verdict ask rebase-interactive "対話的 rebase は扱いません"; return ;;
+      -x | --exec | --exec=*) verdict ask rebase-exec "rebase --exec は任意コマンドを実行します"; return ;;
+      --root) verdict ask rebase-root "--root はルートからの履歴を書き換えます"; return ;;
+      --autostash) verdict ask rebase-autostash "--autostash ではなく、未コミット変更を明示的に保全してください"; return ;;
+      --no-verify) verdict ask rebase-no-verify "--no-verify は保護を迂回します"; return ;;
+    esac
+  done
+  LOG_OP="git rebase"; LOG_REFS="$CUR_BRANCH"
+  if [ -z "$CUR_BRANCH" ]; then verdict ask rebase-detached "detached HEAD の rebase は対象を確認できません"; return; fi
+  if is_protected "$CUR_BRANCH"; then verdict ask rebase-protected "統合ブランチ $CUR_BRANCH の履歴は書き換えません"; return; fi
+  local d
+  d=$(dirty_tracked)
+  if [ -n "$d" ]; then
+    verdict deny rebase-dirty "未コミットの変更があります（$(list_head "$d")）。作業対象ならコミット、そうでなければ保全方法を確認してから rebase してください"; return
+  fi
+  if [ -z "$(g for-each-ref --points-at "$HEAD_OID" --format='%(refname)' 'refs/claude-backup/' 2>/dev/null)" ]; then
+    verdict deny rebase-no-backup "rebase 前の commit を指す退避 ref がありません。先に git update-ref refs/claude-backup/$CUR_BRANCH/$(date -u +%Y%m%dT%H%M%SZ) HEAD を実行してください"; return
+  fi
+  LOG_OIDS="before:$(short "$HEAD_OID")"
+  verdict pass rebase ""
+}
+
+git_config_cmd() {
+  local scope="" write=0 a i
+  local -a pos=()
+  for ((i = ARG_START; i < ${#WORDS[@]}; i++)); do
+    a="${WORDS[$i]}"
+    case "$a" in
+      --global | --system) scope="$a" ;;
+      -f | --file | --blob) scope="$a"; i=$((i + 1)) ;;
+      --file=* | --blob=*) scope="${a%%=*}" ;;
+      --get | --get-all | --get-regexp | --get-urlmatch | --get-color | --get-colorbool | -l | --list | --show-origin | --show-scope | --name-only | -z | --null | --type* | --bool | --int | --path | --default*) ;;
+      --unset | --unset-all | --add | --replace-all | --rename-section | --remove-section | -e | --edit) write=1 ;;
+      --local | --worktree) ;;
+      -*) ;;
+      *) pos+=("$a") ;;
+    esac
+  done
+  case "${pos[0]}" in
+    get | list) return ;;
+    set | unset | edit | rename-section | remove-section) write=1; pos=("${pos[@]:1}") ;;
+  esac
+  [ ${#pos[@]} -ge 2 ] && write=1
+  [ "$write" = 1 ] || return
+  LOG_OP="git config"; LOG_REFS="${pos[0]}"
+  case "$scope" in
+    --global | --system) verdict deny config-personal "個人・システム設定（${scope}）は変更しません"; return ;;
+    ?*) verdict ask config-file "設定ファイルを指定した書き込みは確認が必要です"; return ;;
+  esac
+  case "$(printf '%s' "${pos[0]}" | tr 'A-Z' 'a-z')" in
+    credential* | core.hookspath | core.sshcommand | core.askpass | url.* | remote.*.url | remote.*.pushurl | alias.* | http.* | include.* | includeif.* | gpg.* | user.signingkey | commit.gpgsign | receive.* | transfer.*)
+      verdict ask config-sensitive "${pos[0]} は認証・保護・対象 remote に関わる設定です"; return ;;
+  esac
+  verdict pass config ""
+}
+
+classify_git() {
+  local i=$((CMD_INDEX + 1)) a dir
+  GDIR="$EFF_DIR"
+  while [ $i -lt ${#WORDS[@]} ]; do
+    a="${WORDS[$i]}"
+    case "$a" in
+      -C)
+        dir="${WORDS[$((i + 1))]}"
+        [ "${DYNS[$((i + 1))]}" = 1 ] && DIR_UNKNOWN=1
+        case "$dir" in /*) GDIR="$dir" ;; *) GDIR="$GDIR/$dir" ;; esac
+        i=$((i + 2)) ;;
+      -c)
+        case "$(printf '%s' "${WORDS[$((i + 1))]}" | tr 'A-Z' 'a-z')" in
+          alias.* | core.hookspath* | credential* | core.sshcommand* | url.* | core.askpass*) RISKY_CFG="${WORDS[$((i + 1))]%%=*}" ;;
+        esac
+        i=$((i + 2)) ;;
+      --git-dir | --work-tree | --namespace) ALT_GITDIR=1; i=$((i + 2)) ;;
+      --git-dir=* | --work-tree=* | --namespace=*) ALT_GITDIR=1; i=$((i + 1)) ;;
+      --exec-path=*) ALT_GITDIR=1; i=$((i + 1)) ;;
+      -*) i=$((i + 1)) ;;
+      *) break ;;
+    esac
+  done
+  SUB="${WORDS[$i]}"
+  ARG_START=$((i + 1))
+  [ -n "$SUB" ] || return
+  if [ "${DYNS[$i]}" = 1 ]; then verdict ask git-dynamic-sub "git のサブコマンドが動的です"; return; fi
+
+  REPO_TOP=$(g rev-parse --show-toplevel 2>/dev/null)
+  if [ -n "$REPO_TOP" ] && [ -n "$PROJECT_TOP" ] && [ "$REPO_TOP" != "$PROJECT_TOP" ]; then
+    OUT_OF_PROJECT=1; OUT_TARGET="$REPO_TOP"
+  fi
+  CUR_BRANCH=$(g symbolic-ref -q --short HEAD 2>/dev/null)
+  HEAD_OID=$(g rev-parse -q --verify HEAD 2>/dev/null)
+  if [ -n "$RISKY_CFG" ]; then LOG_OP="git $SUB"; verdict ask inline-config "-c $RISKY_CFG は保護や認証の挙動を変えうるため確認が必要です"; return; fi
+
+  case "$SUB" in
+    status | diff | log | show | rev-parse | rev-list | ls-files | ls-tree | ls-remote | show-ref | cat-file | \
+      describe | blame | grep | shortlog | merge-base | name-rev | for-each-ref | var | help | version | \
+      count-objects | fsck | cherry | range-diff | whatchanged | check-ignore | check-attr | verify-commit | \
+      verify-tag | show-branch | annotate | diff-tree | diff-files | diff-index | hash-object | archive | \
+      bundle | format-patch | request-pull | maintenance | init | clone | cherry-pick | revert | am | apply | \
+      add | mv | rm | notes | submodule | lfs | bisect | sparse-checkout | hook | rerere | mergetool | difftool)
+      return ;;
+    fetch)
+      local j
+      for ((j = ARG_START; j < ${#WORDS[@]}; j++)); do
+        case "${WORDS[$j]}" in
+          *:refs/remotes/* | *:) ;;
+          -*) ;;
+          *:*) LOG_OP="git fetch"; verdict ask fetch-local-ref "fetch の refspec がローカルブランチを書き換えます"; return ;;
+        esac
+      done
+      return ;;
+    pull)
+      local j
+      for ((j = ARG_START; j < ${#WORDS[@]}; j++)); do
+        case "${WORDS[$j]}" in
+          -f | --force) LOG_OP="git pull"; verdict ask pull-force "pull --force はローカルの ref を上書きしえます"; return ;;
+          --no-verify) LOG_OP="git pull"; verdict ask pull-no-verify "--no-verify は保護を迂回します"; return ;;
+        esac
+      done
+      LOG_OP="git pull"; LOG_REFS="$CUR_BRANCH"; verdict pass pull ""; return ;;
+    push) git_push ;;
+    commit)
+      local j
+      for ((j = ARG_START; j < ${#WORDS[@]}; j++)); do
+        case "${WORDS[$j]}" in
+          --no-verify | -n) LOG_OP="git commit"; verdict ask commit-no-verify "--no-verify は pre-commit の保護を迂回します"; return ;;
+          -m | -F | -C | -c | --message | --file | --author | --date | --fixup | --squash | --trailer) j=$((j + 1)) ;;
+        esac
+      done
+      LOG_OP="git commit"; LOG_REFS="$CUR_BRANCH"
+      if [ -n "$CUR_BRANCH" ] && is_protected "$CUR_BRANCH"; then
+        verdict ask commit-protected "統合ブランチ $CUR_BRANCH に直接コミットしようとしています。作業 branch を作成してください"; return
+      fi
+      verdict pass commit "" ;;
+    merge)
+      local j
+      for ((j = ARG_START; j < ${#WORDS[@]}; j++)); do
+        case "${WORDS[$j]}" in
+          --abort | --continue | --quit) return ;;
+          --no-verify) LOG_OP="git merge"; verdict ask merge-no-verify "--no-verify は保護を迂回します"; return ;;
+        esac
+      done
+      LOG_OP="git merge"; LOG_REFS="$CUR_BRANCH"
+      if [ -n "$CUR_BRANCH" ] && is_protected "$CUR_BRANCH"; then
+        verdict ask merge-protected "統合ブランチ $CUR_BRANCH へのローカル merge です。PR 経由で統合してください"; return
+      fi
+      verdict pass merge "" ;;
+    rebase) git_rebase ;;
+    reset) git_reset ;;
+    checkout) git_checkout checkout ;;
+    switch) git_checkout switch ;;
+    restore) git_restore ;;
+    clean) git_clean ;;
+    branch) git_branch ;;
+    stash)
+      case "${WORDS[$ARG_START]}" in
+        drop | clear) LOG_OP="git stash"; verdict ask stash-drop "stash の削除は保全した変更を失います" ;;
+      esac ;;
+    tag)
+      local j
+      for ((j = ARG_START; j < ${#WORDS[@]}; j++)); do
+        case "${WORDS[$j]}" in
+          -d | --delete | -f | --force) LOG_OP="git tag"; verdict ask tag-rewrite "タグの削除・付け替えは確認が必要です"; return ;;
+        esac
+      done ;;
+    update-ref)
+      LOG_OP="git update-ref"
+      local j ref="" del=0
+      for ((j = ARG_START; j < ${#WORDS[@]}; j++)); do
+        case "${WORDS[$j]}" in
+          -d) del=1 ;;
+          --stdin) verdict ask update-ref-stdin "update-ref --stdin は対象を確認できません"; return ;;
+          -*) ;;
+          *) [ -z "$ref" ] && ref="${WORDS[$j]}" ;;
+        esac
+      done
+      LOG_REFS="$ref"
+      case "$ref" in
+        refs/claude-backup/*)
+          if [ "$del" = 1 ]; then verdict ask backup-delete "退避 ref $ref を削除しようとしています"; return; fi
+          LOG_OIDS="$(short "$HEAD_OID")"
+          verdict pass backup-ref "" ;;
+        *) verdict ask update-ref "ref $ref を直接書き換えます" ;;
+      esac ;;
+    symbolic-ref)
+      local j cnt=0
+      for ((j = ARG_START; j < ${#WORDS[@]}; j++)); do
+        case "${WORDS[$j]}" in -d | --delete) cnt=9 ;; -*) ;; *) cnt=$((cnt + 1)) ;; esac
+      done
+      [ $cnt -ge 2 ] && { LOG_OP="git symbolic-ref"; verdict ask symbolic-ref "symbolic ref を書き換えます"; } ;;
+    reflog)
+      case "${WORDS[$ARG_START]}" in
+        expire | delete) LOG_OP="git reflog"; verdict ask reflog-expire "reflog の削除は復旧手段を失います" ;;
+      esac ;;
+    gc)
+      local j
+      for ((j = ARG_START; j < ${#WORDS[@]}; j++)); do
+        case "${WORDS[$j]}" in --prune=* | --prune) LOG_OP="git gc"; verdict ask gc-prune "到達不能 object の即時削除は復旧手段を失います"; return ;; esac
+      done ;;
+    prune | filter-branch | filter-repo | replace)
+      LOG_OP="git $SUB"; verdict ask history-rewrite "git $SUB は履歴や object を不可逆に変更します" ;;
+    worktree)
+      case "${WORDS[$ARG_START]}" in
+        remove)
+          local j
+          for ((j = ARG_START; j < ${#WORDS[@]}; j++)); do
+            case "${WORDS[$j]}" in -f | --force) LOG_OP="git worktree"; verdict ask worktree-force "worktree の強制削除は未保存変更を失います"; return ;; esac
+          done ;;
+      esac ;;
+    remote)
+      case "${WORDS[$ARG_START]}" in
+        add | remove | rm | rename | set-url) LOG_OP="git remote"; verdict ask remote-change "remote の追加・変更は push 先を変えます" ;;
+      esac ;;
+    config) git_config_cmd ;;
+    *)
+      if g config --get "alias.$SUB" >/dev/null 2>&1; then
+        LOG_OP="git $SUB"; verdict ask git-alias "git $SUB は alias のため実体を確認できません"
+      fi ;;
+  esac
+}
+
+# ---------------------------------------------------------------- gh
+
+repo_slug() { # URL / owner/name / host/owner/name -> owner/name（小文字）
+  printf '%s' "$1" | sed -e 's#\.git$##' -e 's#/$##' -e 's#^.*[:/]\([^/:]*/[^/:]*\)$#\1#' | tr 'A-Z' 'a-z'
+}
+
+gh_pr_merge() {
+  local sel="" auto=0 match="" a i
+  for ((i = ARG_START; i < ${#WORDS[@]}; i++)); do
+    a="${WORDS[$i]}"
+    case "$a" in
+      --admin) verdict deny pr-merge-admin "--admin はブランチ保護・必須レビューを迂回します"; return ;;
+      --disable-auto) return ;;
+      --auto) auto=1 ;;
+      --match-head-commit) match="${WORDS[$((i + 1))]}"; i=$((i + 1)) ;;
+      --match-head-commit=*) match="${a#*=}" ;;
+      -b | --body | -F | --body-file | -t | --subject | -A | --author-email | -R | --repo) i=$((i + 1)) ;;
+      -*) ;;
+      *) [ -z "$sel" ] && sel="$a" ;;
+    esac
+  done
+  LOG_OP="gh pr merge"
+  if has_dynamic; then verdict ask pr-merge-dynamic "merge 対象の PR が動的で確認できません"; return; fi
+
+  local json
+  if ! json=$(cd "$GDIR" && gh pr view $sel ${GH_REPO_FLAG:+--repo "$GH_REPO_FLAG"} \
+    --json number,state,isDraft,baseRefName,headRefName,headRefOid,mergeStateStatus,reviewDecision,statusCheckRollup 2>/dev/null); then
+    verdict ask pr-merge-unknown "PR の状態を取得できないため merge 条件を確認できません"; return
+  fi
+  local number state draft base head head_oid mstate review
+  number=$(printf '%s' "$json" | jq -r '.number')
+  state=$(printf '%s' "$json" | jq -r '.state')
+  draft=$(printf '%s' "$json" | jq -r '.isDraft')
+  base=$(printf '%s' "$json" | jq -r '.baseRefName')
+  head=$(printf '%s' "$json" | jq -r '.headRefName')
+  head_oid=$(printf '%s' "$json" | jq -r '.headRefOid')
+  mstate=$(printf '%s' "$json" | jq -r '.mergeStateStatus // "UNKNOWN"')
+  review=$(printf '%s' "$json" | jq -r '.reviewDecision // ""')
+  LOG_REFS="PR#$number $head->$base"; LOG_OIDS="head:$(short "$head_oid")"
+
+  [ "$state" = OPEN ] || { verdict deny pr-merge-state "PR #$number は $state です"; return; }
+  [ "$draft" = true ] && { verdict deny pr-merge-draft "PR #$number は draft です"; return; }
+  local want
+  want=$(integration_base)
+  if [ "$base" != "$want" ]; then
+    verdict ask pr-merge-base "PR #$number の統合先 $base が想定（${want}）と異なります"; return
+  fi
+  if [ -n "$match" ] && [ "${head_oid#"$match"}" = "$head_oid" ]; then
+    verdict deny pr-merge-head-moved "PR #$number の head（$(short "$head_oid")）が指定 $match と一致しません"; return
+  fi
+  if [ "$CUR_BRANCH" != "$head" ] || [ "$HEAD_OID" != "$head_oid" ]; then
+    verdict deny pr-merge-unverified-head "PR #$number の head（$head@$(short "$head_oid")）が、検証したローカル（${CUR_BRANCH:-detached}@$(short "$HEAD_OID")）と一致しません。PR のブランチで最新を取得・検証してから merge してください"; return
+  fi
+  local d
+  d=$(dirty_tracked)
+  if [ -n "$d" ]; then verdict deny pr-merge-dirty "未コミットの変更があり、検証した内容と PR の内容が一致しません"; return; fi
+
+  local failing pending
+  failing=$(printf '%s' "$json" | jq -r '[.statusCheckRollup[]? | select((.conclusion // "") as $c | (.state // "") as $s |
+    ($c | test("^(FAILURE|CANCELLED|TIMED_OUT|ACTION_REQUIRED|STARTUP_FAILURE|STALE)$")) or ($s | test("^(FAILURE|ERROR)$"))) | (.name // .context)] | join(", ")')
+  pending=$(printf '%s' "$json" | jq -r '[.statusCheckRollup[]? | select(((.status // "COMPLETED") != "COMPLETED") or ((.state // "") | test("^(PENDING|EXPECTED)$"))) | (.name // .context)] | join(", ")')
+  [ -z "$failing" ] || { verdict deny pr-merge-checks-failed "失敗しているチェックがあります: $failing"; return; }
+  if [ "$auto" = 0 ]; then
+    [ -z "$pending" ] || { verdict deny pr-merge-checks-pending "完了していないチェックがあります: $pending"; return; }
+    case "$review" in
+      CHANGES_REQUESTED | REVIEW_REQUIRED) verdict deny pr-merge-review "レビュー条件を満たしていません（${review}）"; return ;;
+    esac
+    case "$mstate" in
+      CLEAN | HAS_HOOKS) ;;
+      BLOCKED) verdict deny pr-merge-blocked "保護ルールにより merge できない状態です（BLOCKED）"; return ;;
+      BEHIND) verdict deny pr-merge-behind "統合先に追従していません（BEHIND）"; return ;;
+      DIRTY) verdict deny pr-merge-conflict "統合先と競合しています（DIRTY）"; return ;;
+      *) verdict ask pr-merge-state-unknown "merge 可否を確認できません（${mstate}）"; return ;;
+    esac
+  fi
+
+  if [ "${CLAUDE_GIT_GUARD_REQUIRE_VERIFY:-1}" != 0 ]; then
+    local verify="$SCRIPT_DIR/verify" vout vcode
+    if [ ! -x "$verify" ]; then
+      verdict ask pr-merge-no-verify "検証の共通入口（scripts/verify）が無いため、検証済みか確認できません"; return
+    fi
+    vout=$(cd "$REPO_TOP" && "$verify" status 2>&1)
+    vcode=$?
+    if [ "$vcode" != 0 ]; then
+      verdict deny pr-merge-unverified "最新の差分に有効な検証証跡がありません（$(printf '%s' "$vout" | head -1)）。verify run で PASS を確認してください"; return
+    fi
+  fi
+  verdict pass pr-merge ""
+}
+
+classify_gh() {
+  local a group="" sub="" j group_idx=-1
+  GDIR="$EFF_DIR"
+  GH_REPO_FLAG=""
+  ARG_START=${#WORDS[@]}
+  for ((j = CMD_INDEX + 1; j < ${#WORDS[@]}; j++)); do
+    a="${WORDS[$j]}"
+    case "$a" in
+      -R | --repo) GH_REPO_FLAG="${WORDS[$((j + 1))]}"; j=$((j + 1)); continue ;;
+      --repo=*) GH_REPO_FLAG="${a#--repo=}"; continue ;;
+      -R?*) GH_REPO_FLAG="${a#-R}"; continue ;;
+    esac
+    if [ -z "$group" ]; then
+      case "$a" in -*) continue ;; esac
+      group="$a"; group_idx=$j; ARG_START=$((j + 1))
+    elif [ -z "$sub" ]; then
+      case "$a" in -*) continue ;; esac
+      sub="$a"; ARG_START=$((j + 1))
+    fi
+  done
+  GROUP_IDX=$group_idx
+  [ -n "$group" ] || return
+
+  REPO_TOP=$(g rev-parse --show-toplevel 2>/dev/null)
+  CUR_BRANCH=$(g symbolic-ref -q --short HEAD 2>/dev/null)
+  HEAD_OID=$(g rev-parse -q --verify HEAD 2>/dev/null)
+  if [ -n "$REPO_TOP" ] && [ -n "$PROJECT_TOP" ] && [ "$REPO_TOP" != "$PROJECT_TOP" ]; then
+    OUT_OF_PROJECT=1; OUT_TARGET="$REPO_TOP"
+  fi
+  if [ -n "$GH_REPO_FLAG" ]; then
+    local origin
+    origin=$(g remote get-url origin 2>/dev/null)
+    if [ -z "$origin" ] || [ "$(repo_slug "$GH_REPO_FLAG")" != "$(repo_slug "$origin")" ]; then
+      OUT_OF_PROJECT=1; OUT_TARGET="$GH_REPO_FLAG"
+    fi
+  fi
+  LOG_OP="gh $group${sub:+ $sub}"
+
+  case "$group" in
+    auth)
+      case "$sub" in status | "") return ;; esac
+      verdict deny gh-auth "認証情報の変更・表示（gh auth ${sub}）は通常の実装範囲外です" ;;
+    secret | variable | ssh-key | gpg-key)
+      case "$sub" in list | get | "") return ;; esac
+      verdict deny gh-secret "秘密情報・鍵・変数の変更（gh $group ${sub}）は通常の実装範囲外です" ;;
+    config)
+      case "$sub" in get | list | "") return ;; esac
+      verdict deny gh-config "gh の個人設定は変更しません" ;;
+    repo)
+      case "$sub" in
+        view | list | clone | set-default | "") return ;;
+        delete | archive | unarchive | rename | edit | deploy-key) verdict deny gh-repo-admin "リポジトリの削除・公開範囲・権限に関わる操作（gh repo ${sub}）は通常の実装範囲外です" ;;
+        *) verdict ask gh-repo "gh repo $sub は作業対象リポジトリの外に影響します" ;;
+      esac ;;
+    api) gh_api ;;
+    pr)
+      case "$sub" in
+        merge) gh_pr_merge ;;
+        checkout)
+          for ((j = ARG_START; j < ${#WORDS[@]}; j++)); do
+            case "${WORDS[$j]}" in -f | --force) verdict ask gh-pr-checkout-force "gh pr checkout --force はローカルブランチを上書きします"; return ;; esac
+          done ;;
+        create | edit | comment | close | reopen | ready | review)
+          LOG_REFS="$CUR_BRANCH"; verdict pass "gh-pr-$sub" "" ;;
+      esac ;;
+    issue)
+      case "$sub" in
+        delete | transfer | lock | unlock) verdict ask gh-issue-admin "gh issue $sub は確認が必要です" ;;
+      esac ;;
+    release | gist | extension | alias | codespace | ruleset | project | cache | label | workflow | run | org | attestation)
+      case "$sub" in
+        list | view | download | status | watch | "" | rerun | cancel | diff | check) return ;;
+        create | edit | comment) [ "$group" = label ] && return ;;
+      esac
+      case "$group/$sub" in
+        run/delete | cache/delete | label/delete | workflow/* | release/* | gist/* | extension/* | alias/* | codespace/delete | project/delete | project/close)
+          verdict ask "gh-$group" "gh $group $sub は通常の実装範囲外の公開・削除・設定変更を含みえます" ;;
+      esac ;;
+  esac
+}
+
+gh_api() {
+  local method="" fields=0 endpoint="" a j mutation=0
+  for ((j = GROUP_IDX + 1; j < ${#WORDS[@]}; j++)); do
+    a="${WORDS[$j]}"
+    case "$a" in
+      -X | --method) method="${WORDS[$((j + 1))]}"; j=$((j + 1)) ;;
+      --method=*) method="${a#--method=}" ;;
+      -X?*) method="${a#-X}" ;;
+      -f | -F | --field | --raw-field) fields=1; case "${WORDS[$((j + 1))]}" in *mutation*) mutation=1 ;; esac; j=$((j + 1)) ;;
+      --input) fields=1; j=$((j + 1)) ;;
+      -H | --header | -q | --jq | -t | --template | --hostname | --cache | -p | --preview) j=$((j + 1)) ;;
+      -*) ;;
+      *) [ -z "$endpoint" ] && endpoint="$a" ;;
+    esac
+  done
+  method=$(printf '%s' "$method" | tr 'a-z' 'A-Z')
+  [ -n "$method" ] || { [ "$fields" = 1 ] && method=POST || method=GET; }
+  LOG_OP="gh api $method"; LOG_REFS="$endpoint"
+  if [ "$endpoint" = graphql ]; then
+    [ "$mutation" = 1 ] || has_dynamic || return
+    verdict ask gh-api-mutation "GraphQL mutation（または内容を確認できない graphql 呼び出し）は確認が必要です"; return
+  fi
+  [ "$method" = GET ] && return
+  case "$endpoint" in
+    *secrets* | *variables* | *keys* | *collaborators* | *hooks* | *permissions* | */protection* | *rulesets* | *teams* | *members* | *invitations* | *environments* | *actions/* | repos/*/*/transfer)
+      verdict deny gh-api-admin "権限・秘密・保護設定に関わる API の変更（$method ${endpoint}）は通常の実装範囲外です"; return ;;
+  esac
+  case "$method" in
+    DELETE | PATCH | PUT)
+      if printf '%s' "$endpoint" | grep -Eq '^/?repos/[^/]+/[^/]+/?$'; then
+        verdict deny gh-api-admin "リポジトリ自体の変更・削除（$method ${endpoint}）は通常の実装範囲外です"; return
+      fi ;;
+  esac
+  verdict ask gh-api-write "gh api の書き込み（$method ${endpoint}）は対象と内容を確認してから実行します"
+}
+
+# ---------------------------------------------------------------- セグメント単位の判定
+
+SHELL_WRAPPERS=" sh bash zsh dash ksh fish eval source . xargs sudo doas watch parallel find timeout nice ionice script su "
+
+analyze_segment() {
+  local i=0 w base
+  LOG_OP=""; LOG_REFS=""; LOG_OIDS=""; PUSH_REMOTE=""; REPO_TOP=""; CUR_BRANCH=""; HEAD_OID=""
+  OUT_OF_PROJECT=0; OUT_TARGET=""; ALT_GITDIR=0; RISKY_CFG=""; SUB=""
+  while [ $i -lt ${#WORDS[@]} ]; do
+    w="${WORDS[$i]}"
+    case "$w" in
+      [A-Za-z_]*=*) i=$((i + 1)) ;;
+      '!' | '{' | '}' | then | do | else | elif | if | while | until | time | command | builtin | nohup | exec | env | -*) i=$((i + 1)) ;;
+      *) break ;;
+    esac
+  done
+  [ $i -lt ${#WORDS[@]} ] || return
+  base="${WORDS[$i]##*/}"
+  CMD_INDEX=$i
+
+  if [ "${DYNS[$i]}" = 1 ]; then
+    LOG_OP="dynamic"
+    verdict ask dynamic-command "実行するコマンド名が動的なため git / gh かどうか確認できません"
+    return
+  fi
+
+  case "$base" in
+    git)
+      classify_git
+      case "$SUB" in
+        switch | checkout | rebase | reset | merge | pull | stash | cherry-pick | revert | am | bisect | worktree)
+          [ -n "$STATE_SHIFTED" ] || STATE_SHIFTED="$SUB" ;;
+      esac ;;
+    gh) classify_gh ;;
+    cd | pushd)
+      local d="${WORDS[$((i + 1))]}"
+      if [ "${DYNS[$((i + 1))]}" = 1 ] || [ "$d" = - ]; then DIR_UNKNOWN=1; return; fi
+      case "$d" in
+        "") d="$HOME" ;;
+        "~"*) d="$HOME${d#\~}" ;;
+        /*) ;;
+        *) d="$EFF_DIR/$d" ;;
+      esac
+      EFF_DIR="$d" ;;
+    popd) DIR_UNKNOWN=1 ;;
+    *)
+      case "$SHELL_WRAPPERS" in
+        *" $base "*)
+          if printf '%s %s' "${WORDS[*]:$((i + 1))}" "$BODIES" | grep -Eq '(^|[^A-Za-z0-9_.-])(git|gh)([^A-Za-z0-9_-]|$)'; then
+            LOG_OP="$base"
+            verdict ask indirect "$base 経由の git / gh 実行は内容を確認できないため確認が必要です"
+          fi ;;
+      esac ;;
+  esac
+}
+
+WORDS=()
+DYNS=()
+BODIES=""
+UNTERMINATED=0
+while IFS= read -r -u 3 line; do
+  case "$line" in
+    T*) DYNS+=("${line:1:1}"); WORDS+=("${line:2}") ;;
+    B*) BODIES="$BODIES ${line:1}" ;;
+    E) analyze_segment; WORDS=(); DYNS=(); BODIES="" ;;
+    X) UNTERMINATED=1 ;;
+  esac
+done 3<<<"$TOKENS"
+
+if [ "$UNTERMINATED" = 1 ]; then
+  LOG_OP="parse"
+  verdict ask unparsable "コマンドを解析できない（引用符が閉じていない等）ため git / gh の安全確認ができません"
+fi
+
+case "$DECISION" in
+  deny | ask) emit "$DECISION" "$REASONS" ;;
+esac
+exit 0

@@ -25,10 +25,14 @@ tools:
    - 実装前に既存コードを読んで影響範囲を把握する
    - プロジェクトの既存の設計・スタイルに倣う
 4. 各ステップ完了時に TaskUpdate でステータスを更新する
-5. 全ステップ完了後、プロジェクトの検証コマンド（lint / type check / test / build 等）が存在する場合は実行し、エラー・警告ゼロを確認する
-   - 実行すべきコマンドは `package.json` / `Makefile` / `justfile` / `Cargo.toml` / `pyproject.toml` などから自動で検出する
-   - 検証コマンドが不明な場合はユーザーに確認する
+5. 全ステップ完了後、`.claude/scripts/verify run` で検証し、全体の結果が `PASS` になることを確認する（仕様: `.claude/scripts/verify.md`）
+   - 検証コマンドはプロジェクトの `.claude/verify.conf` に明示されたものだけを使う。manifest から推測したコマンドを独自に実行しない
+   - `FAIL`: 失敗した check を修正して再実行する
+   - `BLOCKED (config_missing / no_checks)`: `.claude/scripts/verify suggest` の候補をユーザーに提示し、設定してもらう
+   - その他の `BLOCKED`: 理由を報告し、PASS として扱わない
 6. 適切な粒度でコミットする
+   - 作業対象のファイルだけをパス指定で add する。既存の無関係な変更は含めない
+   - git / gh の操作は `.claude/scripts/git-guard.md` の判断基準に従う。確認できることは自分で確認して進め、変更や他者の commit を失う可能性があるときだけ停止して報告する
 7. 完了報告を出力する
 
 ## 実装方針
