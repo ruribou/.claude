@@ -22,12 +22,13 @@ git clone git@github.com:ruribou/.claude.git .claude
 ```
 .claude/
 ├── README.md              このファイル
-├── settings.json          共有してよい権限設定（git / gh を許可し、範囲外の操作を deny、git-guard Hook を登録）
+├── settings.json          共有してよい権限設定（git / gh を許可し、範囲外の操作を deny、git-guard / command-guard Hook を登録）
 ├── settings.local.json    ユーザーローカル設定（共有しない / .gitignore 推奨）
 ├── review-patterns.md     言語非依存のレビュー観点チェックリスト
 ├── bugfix-discipline.md   バグ修正の判断基準（原因の 3 つの問い・修正の種別 A〜E）
 ├── verify.conf.example    検証アダプター設定の例（プロジェクト側で verify.conf にコピー）
 ├── stop-hook.settings.example.json  完了前確認 Stop hook の設定例（opt-in・既定では無効）
+├── notify.settings.example.json     デスクトップ通知の設定例（opt-in・既定では無効）
 ├── agents/
 │   ├── task-planner.md    対話ヒアリング → 実装計画ドキュメント作成
 │   ├── implementer.md     実装フローから 1 単位を受け取り実装・コミット
@@ -44,12 +45,17 @@ git clone git@github.com:ruribou/.claude.git .claude
 │   ├── checkpoint.md      段階・照合・保存先の仕様
 │   ├── git-guard          git / gh を実行直前の状態と照合する Hook
 │   ├── git-guard.md       自律実行の判断基準・停止条件・判定表
+│   ├── command-guard      git / gh 以外の破壊的コマンド（rm -rf / 、dd、mkfs 等）を止める Hook
+│   ├── command-guard.md   判定表・限界
+│   ├── lib/tokenize.awk   git-guard / command-guard が共有するコマンドの字句解析
 │   ├── verify             検証の共通入口（明示した検証の実行と証跡記録）
 │   ├── verify.md          アダプター設定・結果・証跡の仕様
 │   ├── review             レビュー packet の作成と結果の記録・鮮度判定
 │   ├── review.md          packet・判定・鮮度の仕様
 │   ├── stop-hook          完了前確認の Stop hook（opt-in。checkpoint の active run だけが対象）
-│   └── stop-hook.md       Stop hook の判定・限界・導入方法の仕様
+│   ├── stop-hook.md       Stop hook の判定・限界・導入方法の仕様
+│   ├── notify             デスクトップ通知（opt-in）
+│   └── notify.md          導入方法
 └── skills/
     ├── implement-issue/SKILL.md  /implement-issue <issue>  1 Issue の実装フロー（手順の正本）
     ├── project-knowledge/ プロジェクト固有知識を必要時に参照する Skill
@@ -158,6 +164,10 @@ cp .claude/verify.conf.example .claude/verify.conf   # check 行を書く
 
 詳細は [`scripts/stop-hook.md`](scripts/stop-hook.md)。
 
+## デスクトップ通知（opt-in）
+
+Claude Code が入力を待っているときと、応答を終えたときにデスクトップ通知を出す（macOS / Linux）。個人の好みなので **既定では有効化されない。** [`notify.settings.example.json`](notify.settings.example.json) の `hooks` を `.claude/settings.local.json` にマージして使う。詳細は [`scripts/notify.md`](scripts/notify.md)。
+
 ## 設計方針
 
 - **言語非依存**: TypeScript / React / Python / Go / Rust など、どのスタックでも動くように書かれている。検証コマンド（lint / type check / test / build）はプロジェクト側の `.claude/verify.conf` で明示し、`scripts/verify` が実行する。自動検出は初回設定の候補提示（`verify suggest`）にとどめる
@@ -177,6 +187,8 @@ cp .claude/verify.conf.example .claude/verify.conf   # check 行を書く
 
 判断基準・停止条件・判定表は [`scripts/git-guard.md`](scripts/git-guard.md)。Hook は `jq` を使う（無い場合は git / gh を含むコマンドを確認に回す）。
 
+git / gh 以外のコマンドは権限確認を経て実行されるが、権限確認を省略する実行（bypass permissions など）に備えて、PreToolUse に `scripts/command-guard` も登録している。`rm -rf /`・`dd of=/dev/...`・`mkfs`・システム領域への `chmod -R` など取り返しのつかない操作だけを deny / ask し、それ以外のコマンドには関与しない。判定表と限界は [`scripts/command-guard.md`](scripts/command-guard.md)。保護するパスは `env` の `CLAUDE_COMMAND_GUARD_PROTECTED` で追加できる。
+
 ### 追加の許可を置く場所
 
 | 置き場所 | 用途 | 共有 |
@@ -190,7 +202,7 @@ cp .claude/verify.conf.example .claude/verify.conf   # check 行を書く
 ### 設定を有効にする際の確認手順
 
 1. Claude Code を起動して信頼ダイアログを承認し、`/permissions` と `/hooks` で有効な許可ルール・Hook とその出所（共有 / ローカル / ユーザー）を確認する（未信頼のワークスペースでは `permissions.allow` が無視される）
-2. 必要に応じて `claude --setting-sources project` で共有設定だけを読み込んだ状態で起動し、git / gh 以外のコマンドで確認が求められること、`git push --force` が git-guard に止められることを確かめる
+2. 必要に応じて `claude --setting-sources project` で共有設定だけを読み込んだ状態で起動し、git / gh 以外のコマンドで確認が求められること、`git push --force` が git-guard に止められることを確かめる。command-guard は `jq -n --arg c 'rm -rf /' '{tool_input:{command:$c}}' | .claude/scripts/command-guard` で単体確認できる
 
 ### 注意
 

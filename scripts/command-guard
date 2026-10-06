@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# command-guard — Bash ツールで実行される、git / gh 以外の取り返しのつかないコマンドを実行前に止める Hook。
+# 仕様: scripts/command-guard.md（配置後は .claude/scripts/command-guard.md）
+#
+#   command-guard    PreToolUse。stdin の Hook 入力を判定し、止めるときだけ deny / ask を返す
+#
+# git / gh は git-guard が見る。権限を広げることはしない（allow は返さない）。
+# bash 3.2 互換を保つ（macOS 標準 bash で動かすため）。
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+emit() { # <ask|deny> <reason>
+  jq -n -c --arg d "$1" --arg r "command-guard: $2" \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: $d, permissionDecisionReason: $r}}'
+}
+
+# シェル経由（bash -c 等）で実行される、内容を確認できない破壊的な形
+WRAPPED_RE='(^|[^A-Za-z0-9_.-])(rm[[:space:]]+(-[A-Za-z]*[rR]|--recursive|--no-preserve-root)|dd[[:space:]].*of=/dev/|mkfs|newfs|wipefs|diskutil[[:space:]]+(erase|zeroDisk|randomDisk|secureErase|partitionDisk))'
+
+# 判定対象のコマンド名（これを含まない入力は解析しない）
+DANGER_RE='(^|[^A-Za-z0-9_.-])(rm|dd|mkfs(\.[a-z0-9]+)?|newfs(_[a-z0-9]+)?|wipefs|shred|fdisk|sfdisk|gdisk|parted|diskutil|chmod|chown|chgrp|find)([^A-Za-z0-9_-]|$)|>[[:space:]]*/dev/'
+
+INPUT=$(cat)
+
+if ! command -v jq >/dev/null 2>&1; then
+  # Hook 入力を解析できない。対象のコマンド名を含む可能性があれば確認へ倒す。
+  if printf '%s' "$INPUT" | grep -Eq "$DANGER_RE"; then
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"command-guard: jq が無いため破壊的コマンドの確認ができません"}}'
+  fi
+  exit 0
+fi
+
+CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
+[ -n "$CMD" ] || exit 0
+printf '%s' "$CMD" | grep -Eq "$DANGER_RE" || exit 0
+
+TOKENS=$(printf '%s' "$CMD" | awk -f "$SCRIPT_DIR/lib/tokenize.awk" 2>/dev/null) || TOKENS="X"
+
+# ---------------------------------------------------------------- 判定の集約
+
+DECISION=pass
+REASONS=""
+
+verdict() { # <ask|deny> <reason>
+  case "$1" in
+    deny) DECISION=deny ;;
+    ask) [ "$DECISION" = deny ] || DECISION=ask ;;
+  esac
+  REASONS="${REASONS:+$REASONS / }$2"
+}
+
+# ---------------------------------------------------------------- 対象パス
+
+# 消す・権限を変えると復旧できないパス。末尾の / を落とした形で比べる。
+# CLAUDE_COMMAND_GUARD_PROTECTED（空白区切り）で追加できる。
+CRITICAL_PATHS=" / ~ . .. * /* ~/* ./* ../* /bin /boot /dev /etc /home /lib /lib64 /opt /proc /root /sbin /sys /usr /var /Applications /Library /System /Users /Volumes /private ${CLAUDE_COMMAND_GUARD_PROTECTED:-} "
+
+norm_path() { # 末尾の / を落とす（/ 自体は残す）
+  local p="$1"
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  [ "$p" = "$HOME" ] && p="~"
+  printf '%s' "$p"
+}
+
+is_critical() { # <path>
+  case "$CRITICAL_PATHS" in *" $(norm_path "$1") "*) return 0 ;; esac
+  return 1
+}
+
+# find / chmod 系では相対パス（. や *）は日常的に使うため、絶対パス・ホームだけを対象にする
+is_system_path() { # <path>
+  case "$(norm_path "$1")" in . | .. | '*' | ./* | ../*) return 1 ;; esac
+  is_critical "$1"
+}
+
+# ---------------------------------------------------------------- コマンドごとの判定
+
+check_rm() {
+  local j recursive=0 nopreserve=0 dyn=0 targets=() w
+  for ((j = CMD_INDEX + 1; j < ${#WORDS[@]}; j++)); do
+    w="${WORDS[$j]}"
+    case "$w" in
+      --no-preserve-root) nopreserve=1 ;;
+      --recursive) recursive=1 ;;
+      --) ;;
+      --*) ;;
+      -*) case "$w" in *[rR]*) recursive=1 ;; esac ;;
+      *) targets+=("$w"); [ "${DYNS[$j]}" = 1 ] && dyn=1 ;;
+    esac
+  done
+  [ "$nopreserve" = 1 ] && { verdict deny "rm --no-preserve-root は実行しません"; return; }
+  [ "$recursive" = 1 ] || return
+  for w in "${targets[@]+"${targets[@]}"}"; do
+    is_critical "$w" && { verdict deny "rm -r で ${w} を消そうとしています。消す対象をプロジェクト内の具体的なパスで指定してください"; return; }
+  done
+  [ "$dyn" = 1 ] && verdict ask "rm -r の対象に変数・コマンド置換が含まれます（空になると上位ディレクトリを消します）。展開後のパスを確認してください"
+}
+
+check_dd() {
+  local j w
+  for ((j = CMD_INDEX + 1; j < ${#WORDS[@]}; j++)); do
+    w="${WORDS[$j]}"
+    case "$w" in
+      of=/dev/null | of=/dev/stdout | of=/dev/stderr) ;;
+      of=/dev/*) verdict deny "dd でデバイス（${w#of=}）に書き込みます"; return ;;
+    esac
+  done
+}
+
+check_mode_owner() { # chmod / chown / chgrp
+  local j recursive=0 w args=()
+  for ((j = CMD_INDEX + 1; j < ${#WORDS[@]}; j++)); do
+    w="${WORDS[$j]}"
+    case "$w" in
+      --recursive) recursive=1 ;;
+      --*) ;;
+      -*) case "$w" in *R*) recursive=1 ;; esac ;;
+      *) args+=("$w") ;;
+    esac
+  done
+  [ "$recursive" = 1 ] || return
+  # 先頭の引数はモード / 所有者なので対象から外す
+  for w in "${args[@]:1}"; do
+    is_system_path "$w" && { verdict deny "$BASE -R で ${w} 配下の権限・所有者を書き換えます"; return; }
+  done
+  if [ "$BASE" = chmod ]; then
+    case "${args[0]:-}" in
+      777 | 0777 | a+rwx | ugo+rwx) verdict ask "chmod -R ${args[0]} は配下のすべてを誰でも書き換え可能にします" ;;
+    esac
+  fi
+}
+
+check_find() {
+  local j w start=() deletes=0 in_paths=1
+  for ((j = CMD_INDEX + 1; j < ${#WORDS[@]}; j++)); do
+    w="${WORDS[$j]}"
+    case "$w" in
+      -delete) deletes=1 ;;
+      -exec | -execdir | -ok | -okdir)
+        [ "${WORDS[$((j + 1))]##*/}" = rm ] && deletes=1 ;;
+    esac
+    if [ "$in_paths" = 1 ]; then
+      case "$w" in -* | '(' | '!') in_paths=0 ;; *) start+=("$w") ;; esac
+    fi
+  done
+  [ "$deletes" = 1 ] || return
+  for w in "${start[@]+"${start[@]}"}"; do
+    is_system_path "$w" && { verdict deny "find ${w} 配下のファイルを削除します"; return; }
+  done
+}
+
+check_disk() {
+  local sub="${WORDS[$((CMD_INDEX + 1))]:-}"
+  case "$BASE" in
+    mkfs | mkfs.* | newfs | newfs_* | wipefs) verdict deny "$BASE はファイルシステム・ディスクを初期化します" ;;
+    diskutil)
+      case "$sub" in
+        erase* | zeroDisk | randomDisk | secureErase | partitionDisk | reformat | apfs) verdict deny "diskutil $sub はディスクを消去・再構成します" ;;
+      esac ;;
+    fdisk | sfdisk | gdisk | parted) verdict ask "$BASE はパーティションを変更できます" ;;
+    shred) verdict ask "shred はファイルを復元できない形で上書きします" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- セグメント単位の判定
+
+SHELL_WRAPPERS=" sh bash zsh dash ksh fish eval source . xargs watch parallel script su ssh "
+
+# 前置きコマンド（sudo / env / nice / timeout 等）のうち、引数を 1 つ取るオプション
+ARG_OPTS_sudo=" -u -g -U -C -D -h -p -r -t -T "
+ARG_OPTS_env=" -u -C -S "
+ARG_OPTS_nice=" -n "
+ARG_OPTS_ionice=" -c -n -p "
+ARG_OPTS_timeout=" -s -k --signal --kill-after "
+
+analyze_segment() {
+  local i=0 w prefix="" opts
+  while [ $i -lt ${#WORDS[@]} ]; do
+    w="${WORDS[$i]}"
+    case "$w" in
+      [A-Za-z_]*=*) i=$((i + 1)) ;;
+      '!' | '{' | '}' | then | do | else | elif | if | while | until | time | command | builtin | nohup | exec) i=$((i + 1)) ;;
+      sudo | doas | env | nice | ionice | timeout) prefix="$w"; i=$((i + 1)) ;;
+      -*)
+        case "$prefix" in
+          sudo | doas) opts="$ARG_OPTS_sudo" ;;
+          env) opts="$ARG_OPTS_env" ;;
+          nice) opts="$ARG_OPTS_nice" ;;
+          ionice) opts="$ARG_OPTS_ionice" ;;
+          timeout) opts="$ARG_OPTS_timeout" ;;
+          *) opts="" ;;
+        esac
+        case "$opts" in *" $w "*) i=$((i + 2)) ;; *) i=$((i + 1)) ;; esac ;;
+      *)
+        # timeout は最初の位置引数が時間
+        if [ "$prefix" = timeout ]; then prefix=""; i=$((i + 1)); continue; fi
+        break ;;
+    esac
+  done
+  [ $i -lt ${#WORDS[@]} ] || return
+  [ "${DYNS[$i]}" = 1 ] && return
+  CMD_INDEX=$i
+  BASE="${WORDS[$i]##*/}"
+
+  case "$BASE" in
+    rm) check_rm ;;
+    dd) check_dd ;;
+    chmod | chown | chgrp) check_mode_owner ;;
+    find) check_find ;;
+    mkfs | mkfs.* | newfs | newfs_* | wipefs | diskutil | fdisk | sfdisk | gdisk | parted | shred) check_disk ;;
+    *)
+      case "$SHELL_WRAPPERS" in
+        *" $BASE "*)
+          if printf '%s %s' "${WORDS[*]:$((i + 1))}" "$BODIES" | grep -Eq "$WRAPPED_RE"; then
+            verdict ask "$BASE 経由で実行される破壊的コマンドの内容を確認できません"
+          fi ;;
+      esac ;;
+  esac
+}
+
+WORDS=()
+DYNS=()
+BODIES=""
+UNTERMINATED=0
+while IFS= read -r -u 3 line; do
+  case "$line" in
+    T*) DYNS+=("${line:1:1}"); WORDS+=("${line:2}") ;;
+    B*) BODIES="$BODIES ${line:1}" ;;
+    E) analyze_segment; WORDS=(); DYNS=(); BODIES="" ;;
+    X) UNTERMINATED=1 ;;
+  esac
+done 3<<<"$TOKENS"
+
+# リダイレクトの対象は字句解析で落ちるため、デバイスへの書き込みは元の文字列で見る
+if printf '%s' "$CMD" | grep -Eq '>[[:space:]]*/dev/(sd|hd|vd|xvd|nvme|disk|rdisk|mmcblk)'; then
+  verdict ask "リダイレクトでブロックデバイスに書き込む可能性があります"
+fi
+
+if [ "$UNTERMINATED" = 1 ] && [ "$DECISION" = pass ]; then
+  verdict ask "コマンドを解析できない（引用符が閉じていない等）ため破壊的コマンドの確認ができません"
+fi
+
+case "$DECISION" in
+  deny | ask) emit "$DECISION" "$REASONS" ;;
+esac
+exit 0
