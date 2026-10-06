@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# notify — デスクトップ通知を出す Hook（opt-in。既定では有効化されない）。
+# 仕様: scripts/notify.md（配置後は .claude/scripts/notify.md）
+#
+#   notify <メッセージ>
+#
+# macOS は osascript、Linux は notify-send を使う。どちらも無い環境（クラウド VM など）では何もしない。
+# 通知の失敗で Claude Code の動作を妨げないよう、常に exit 0 で終わる。stdin の Hook 入力は読まない。
+
+msg="${1:-Claude Code}"
+
+if command -v osascript >/dev/null 2>&1; then
+  # AppleScript の文字列リテラルに埋め込むため \ と " をエスケープする
+  esc=$(printf '%s' "$msg" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  osascript -e "display notification \"$esc\" with title \"Claude Code\" sound name \"Glass\"" >/dev/null 2>&1
+elif command -v notify-send >/dev/null 2>&1; then
+  notify-send "Claude Code" "$msg" >/dev/null 2>&1
+fi
+exit 0
