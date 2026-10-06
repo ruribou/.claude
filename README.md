@@ -25,6 +25,7 @@ git clone git@github.com:ruribou/.claude.git .claude
 ├── settings.json          共有してよい権限設定（git / gh を許可し、範囲外の操作を deny、git-guard Hook を登録）
 ├── settings.local.json    ユーザーローカル設定（共有しない / .gitignore 推奨）
 ├── review-patterns.md     言語非依存のレビュー観点チェックリスト
+├── bugfix-discipline.md   バグ修正の判断基準（原因の 3 つの問い・修正の種別 A〜E）
 ├── verify.conf.example    検証アダプター設定の例（プロジェクト側で verify.conf にコピー）
 ├── stop-hook.settings.example.json  完了前確認 Stop hook の設定例（opt-in・既定では無効）
 ├── agents/
@@ -35,6 +36,7 @@ git clone git@github.com:ruribou/.claude.git .claude
 │   ├── review-issue.md    /review-issue <issue>  Issue の受入条件に対する読み取り専用レビュー（補助）
 │   ├── create-task.md     /create-task  実装計画ファイルの作成だけ（任意）
 │   ├── clean-branch.md    /clean-branch マージ済みブランチ整理（任意の保守）
+│   ├── watch-pr.md        /watch-pr [PR]  PR の CI を監視し、落ちたら修正・検証・レビューして green まで回す
 │   ├── start-with-plan.md /start-with-plan <path>  互換入口 → /implement-issue --plan
 │   └── code-review.md     /code-review  互換入口 → /review-issue の手順を Issue 指定なしで
 ├── scripts/
@@ -105,6 +107,7 @@ Issue がない作業は、計画ファイルを入力にできる。
 
 - `/verify` — プロジェクトが明示した検証を実行し、現在の差分に結び付いた証跡を残す（`/implement-issue` も同じ入口を使う）
 - `/review-issue <issue>` — Issue の受入条件に対して現在の差分を読み取り専用でレビューする（`/implement-issue` も同じ reviewer を使う）。修正・コミットはしない
+- `/watch-pr [PR番号]` — PR 作成後の CI を監視し、失敗したら原因を特定して implementer で修正、verify・reviewer を通してから push する。green になるか、3 サイクルで直らなければ止まる。merge はしない
 - `/clean-branch` — マージ済みのローカルブランチを安全に整理する（開発フローとは別の保守操作）
 
 ### 旧コマンドからの移行
